@@ -46,7 +46,7 @@ def _metal_stats() -> dict:
 def load_text_model(
     pack: str | Path | None = None,
     *,
-    use_custom_kernels: bool = False,
+    use_custom_kernels: bool = True,
     load_tokenizer: bool = True,
 ) -> LoadedModel:
     pack = Path(pack or DEFAULT_PACK)

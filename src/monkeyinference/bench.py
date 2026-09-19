@@ -61,7 +61,7 @@ def run_bench(
     parity_layers: int = 8,
     quick: bool = False,
 ) -> dict:
-    loaded = load_text_model(pack, use_custom_kernels=False)
+    loaded = load_text_model(pack, use_custom_kernels=True)
     jobs = [
         {
             "name": "warmup",
@@ -135,7 +135,7 @@ def run_bench(
             "parity": 0,
         },
     ]
-    early_ns = (4,) if quick else EARLY_LAYERS_SWEEP
+    early_ns = (4,)
     for n in early_ns:
         jobs.append(
             {

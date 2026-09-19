@@ -4,7 +4,7 @@ import mlx.core as mx
 import numpy as np
 
 from monkeyinference.hadamard import BLOCK, HADAMARD_SCALE, fwht
-from monkeyinference.kernels import mlx_affine_qmv, stream_copy, ternary_gemv, ternary_qmm
+from monkeyinference.kernels import mlx_affine_qmv, stream_copy, ternary_gemv, ternary_qmm, ternary_qmv_once
 from monkeyinference.roofline import pack_ternary
 from monkeyinference.spec import PromptLookupDrafter
 
@@ -73,6 +73,18 @@ def test_ternary_qmm_batch_matches_gemv():
     x, w, scales, biases = pack_ternary(n, k, seed=9)
     xs = mx.stack([x, x * 0.5, x * -1.0])
     got = ternary_qmm(xs, w, scales)
+    refs = [ternary_gemv(xs[i], w, scales) for i in range(m)]
+    mx.eval(got, *refs)
+    for i in range(m):
+        err = float(mx.max(mx.abs(got[i] - refs[i])).item())
+        assert err < 1e-4, (i, err)
+
+
+def test_ternary_qmv_once_matches_gemv():
+    n, k, m = 256, 512, 6
+    x, w, scales, biases = pack_ternary(n, k, seed=12)
+    xs = mx.stack([x * ((i + 1) * 0.3) for i in range(m)])
+    got = ternary_qmv_once(xs, w, scales)
     refs = [ternary_gemv(xs[i], w, scales) for i in range(m)]
     mx.eval(got, *refs)
     for i in range(m):

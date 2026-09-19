@@ -76,11 +76,10 @@ def _prefill(forward, tokens: mx.array, cache, step: int) -> mx.array:
 
 
 def _default_num_draft(draft: str) -> int:
-    # PLD is free: leftover + 8 tokens is past MLX's qmv/qmm vector_limit on
-    # this 10-core M4 for Bonsai's K/N, so the verify streams weights once.
-    # Early-exit is bandwidth-expensive (lm_head every draft token), so keep K small.
+    # PLD is free; K=5 was 10/10 on the copy prompt. Larger K over-proposes and
+    # pays a reject+replay. Early-exit keeps K small (lm_head every draft token).
     if draft == "pld":
-        return 8
+        return 5
     if draft == "early":
         return 4
     return 0

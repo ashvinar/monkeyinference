@@ -23,7 +23,8 @@ def main(argv: list[str] | None = None) -> int:
     p_gen.add_argument("--draft", choices=("none", "pld", "early"), default="pld")
     p_gen.add_argument("--num-draft", type=int, default=None)
     p_gen.add_argument("--early-layers", type=int, default=4)
-    p_gen.add_argument("--custom", action="store_true", help="Use custom ternary GEMV on M=1 (off unless it beats MLX)")
+    p_gen.add_argument("--custom", action=argparse.BooleanOptionalAction, default=True,
+                       help="Custom qdot GEMV on M=1 (default on; --no-custom uses MLX)")
     p_gen.add_argument("--parity", type=int, default=0)
     p_gen.add_argument("--out", type=Path, default=None)
 
