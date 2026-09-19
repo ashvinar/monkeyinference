@@ -4,7 +4,7 @@ Standalone Metal/MLX runtime for [`prism-ml/Ternary-Bonsai-2-27B-mlx-2bit`](http
 
 This document is the complete technical record. It is written for a reader who has not followed the work. Every speed claim below was gated on **token identity**: argmax tokens from a speculative (or mixed-pack) path must equal leftover-greedy tokens on the same prompt.
 
-**Production decode is 2-bit qdot greedy.** Speculation, five-trit packing, and hybrid CPU/GPU are in the tree as gated experiments. They are net-negative or no-ops on this machine. Do not build always-8 plus GDN commit. Do not convert the pack. Do not train a drafter.
+**Production decode is 2-bit qdot greedy.** Speculation, five-trit packing, and hybrid CPU/GPU are in the tree as gated experiments. They are net-negative or no-ops on this machine. Do not build always-8 plus GDN commit. Do not convert the pack. LoRA on the existing Splash DFlash 2 Q4 draft was tried; held-out accepts went **3.00 → 2.09**. Do not train a drafter from scratch.
 
 ## Straight answer: is there a path past ~11 tok/s?
 
@@ -23,7 +23,8 @@ Speculative decode is how you beat a STREAM ceiling in general. On this GPU it d
 
 - An 8-row verify costs **2.68–2.93×** a greedy step (software 2-bit dequant into threadgroup memory, then MMA). The 1.3× gate was missed.
 - Splash DFlash 2 transfers **3.00 accepts/pass**. Beating 10.22 needs **3.26–3.51**. Predicted best **8.71–9.39 tok/s** even with replay deleted.
-- Closing 3.00 → 4.1+ requires **training** a drafter on this 2-bit target. Even the published dense-target 4.1 accepts at current MMA cost is ~12 tok/s — still the STREAM ceiling, not past it. The high end (5.5) would be ~16 tok/s and is not the number we measured.
+- LoRA r=16 on that Q4 draft (64 Bonsai teacher sequences, 5000 steps, hold out explain) **lowered** held-out accepts to **2.09**. Same-run wall-clock: greedy **10.75**, stock DFlash **5.68**, LoRA **3.68**. Token-identical to leftover greedy. Need **3.51** to win; this run moved the wrong way.
+- Closing 3.00 → 4.1+ would still need a drafter that actually transfers. The LoRA recipe here overfit the distill set. Even the published dense-target 4.1 accepts at current MMA cost is ~12 tok/s — still the STREAM ceiling, not past it. The high end (5.5) would be ~16 tok/s and is not the number we measured.
 
 **The honest sentence:** more memory bandwidth. Prism’s laptop table (llama-bench, no spec) is M4 Pro **18** tok/s, M5 Pro **28**, M5 Max **47**. 10.22 on 86–92 GB/s is in family. A different Mac with a faster bus is the upgrade. This engine is at this hardware’s greedy limit.
 
@@ -74,8 +75,9 @@ Greedy, thinking off, temperature 0. Language tensors **7.674 GB** on disk (6.82
 | STREAM ceiling | **11.3–12.7** | 80–90% reached |
 | PLD copy-prompt | **11.70** vs 8.19 leftover greedy | 10/10 accepts; **copyable prompt only** |
 | DFlash K=2 (default) | **7.32** | 2.29 accepts/pass; net-negative vs greedy |
-| DFlash K=7 e2e (MMA + replay) | **5.07** | 3.00 accepts/pass; token-identical |
+| DFlash K=7 e2e (MMA + replay) | **5.07** then **5.68** | 3.00 accepts/pass; token-identical |
 | DFlash K=7 predicted, replay=0 | **8.71–9.39** | still below 10.22 |
+| DFlash K=7 + LoRA r=16 e2e | **3.68** | **2.09** accepts/pass; identity-ok; **loses to stock draft** |
 | llama.cpp Metal PQ2_0 tg128 | 6.71 ± 1.40 | different pack |
 
 France → `Paris`. Explain prompt emits a coherent draft/verify explanation, token-stable across greedy / leftover / DFlash.
@@ -194,7 +196,7 @@ Each row is a thing that was measured and killed. None of these are “not yet t
 
 **Measurement:** official Splash `draft/` only (1.266 GB, vocab/hidden match). DFlash is block-diffusion: `propose(k)` always runs leftover+MASK×7, then `select()` walks k — backbone cost is **almost flat in K** (37–46 ms), not K sequential AR steps. Accepts/pass at K=7 is **3.00**, token-identical to leftover greedy. Break-even table (next section) is the formal kill.
 
-**Ruling:** speculation is net-negative on this hardware at the measured acceptance. Available behind `--speculative`, off by default. PLD 11.70 is a copy-prompt number (2.8 accepts at n-gram cost ≈ 0), not a chat number.
+**Ruling:** speculation is net-negative on this hardware at the measured acceptance. Available behind `--speculative`, off by default. PLD 11.70 is a copy-prompt number (2.8 accepts at n-gram cost ≈ 0), not a chat number. LoRA on the existing Q4 draft made acceptance worse, not better (next section).
 
 ## Break-even table
 
@@ -222,13 +224,37 @@ A GEMV-only envelope `accepts > 2.25 + K × draft_step` would call K=7 a win (3.
 | 3 | 41.7 | 340 | 2.53 | 7.44 | 3.47 | no |
 | **7** | **46.2** | **344** | **3.00** | **8.71** | **3.51** | **no** |
 
-Five-trit did not drop T=8 (MMA stays 2-bit). Speculation stayed short. DFlash K=7 e2e with MMA+replay is **5.07 tok/s**, identity-ok.
+Five-trit did not drop T=8 (MMA stays 2-bit). Speculation stayed short. DFlash K=7 e2e with MMA+replay is **5.07 tok/s** historically and **5.68 tok/s** on the 2026-09-19 compare (same 3.00 accepts; identity-ok).
 
-## The open lead: acceptance gap
+**After LoRA distill of the existing Q4 draft** (same mix-pass T=8 298 ms + draft 46.2 ms = 344 ms pass; greedy baseline **10.22**). Same-process compare 2026-09-19, LPM off, greedy **10.75** tok/s in that process:
 
-If anyone reopens speculation, this is the only remaining lever, and **it would need training** to move. Do not train in this repo. Do not chase another kernel.
+| Draft | accepts/pass | e2e tok/s | pred tok/s (replay=0) | min accepts vs 10.22 | wins? | identity |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Stock Splash Q4 | **3.00** | **5.68** | **8.71** | **3.51** | **no** | yes |
+| LoRA r=16, 5000 steps | **2.09** | **3.68** | **6.06** | **3.51** | **no** | yes |
 
-DFlash K=7, 48 gen, 16 verify passes, 3.00 accepts/pass, token-identical. Mean **2.00** draft tokens accepted per pass (plus bonus). First-reject slot:
+Adapter draft time per pass in this e2e run was ~48 ms stock vs ~73 ms LoRA (more passes, plus LoRA compute). The paper row still uses the mix-pass **46.2 ms** stock propose, which is the *optimistic* LoRA case. Using 73 ms would raise the bar to ~3.79 accepts and drop predicted tok/s to ~5.6. Either way it loses. Production `--draft dflash` stays on stock Q4; adapters are opt-in.
+
+## LoRA distill — tried, overfit
+
+Authorized experiment: fine-tune the existing Splash DFlash 2 Q4 draft onto 2-bit Bonsai (hidden-state aux + argmax continuations). Not a from-scratch drafter. Full FT of 1.80B params needs ~25 GB and does not fit (13–15 GB free / 24 GB unified). LoRA r=16 is 8.65M params, ~104 MB Adam.
+
+| | |
+| --- | --- |
+| Teacher | 2-bit Bonsai leftover-greedy + layers 5/19/33/47/61 aux concat (25600) |
+| Distill set | 64 prompts, hold out explain + France |
+| Windows | 3032 |
+| Steps | 5000 (checkpoint every 200). Collect 64/64. Train landed 5000/5000. Wall GPU ~63 min; wall clock ~12 h because the machine slept mid-run. |
+| Adapter | `~/.monkey/dflash-ft/adapters.safetensors` (33 MB) |
+| Identity | leftover-greedy verify. Stock, LoRA, and greedy tokens matched on explain. France → `Paris`. |
+
+Need **>3.51** accepts/pass to beat 10.22 on paper. Stock baseline **3.00**. LoRA held-out **2.09**. Documented miss; did not start a second long run.
+
+## The closed lead: acceptance gap
+
+If anyone reopens speculation, this is still the only remaining lever, and a different training recipe would be required. The LoRA run above is that experiment; it overfit. Do not chase another kernel.
+
+DFlash K=7 stock, 48 gen, 16 verify passes, 3.00 accepts/pass, token-identical. Mean **2.00** draft tokens accepted per pass (plus bonus). First-reject slot (stock, compare run — same 3/6/2/2/1/1/0/1 histogram as the original k_sweep):
 
 | Drafts accepted before reject | passes | frac |
 | ---: | ---: | ---: |
@@ -243,13 +269,15 @@ DFlash K=7, 48 gen, 16 verify passes, 3.00 accepts/pass, token-identical. Mean *
 
 Rejects are **front-loaded**, not uniform scatter: **56% of passes die at 0 or 1**. Token 1 is usually right (**81%**) and the block then falls over. That matches a target distribution the drafter was not trained on (2-bit Bonsai vs the dense Qwen3.8-27B target), not a random unpack bug.
 
+LoRA r=16, same prompt, 23 verify passes, **2.09** accepts/pass. First-reject: slot 0 **9/23 (39%)**, slot 1 **8/23 (35%)** — **74% die at 0 or 1**. Token identity still held. The adapter did not close the distribution gap; it amplified front-loaded rejects.
+
 Checks already done, not the gap:
 
 - Draft Q4 unpack vs numpy, synthetic max abs **0.044** (bf16 scale truncation + fp16 qmm).
 - fp16 DFlash residual: `|h|≈5e4`, ULP 32, **0/308** drafts accepted even when finite. Residual stays float32 because the magnitude requires it.
 - Token identity holds, so reject/rollback is not silently diverging.
 
-Published DFlash transfer on a dense target is 4.1–5.5 accepts/pass. 3.00 vs that is the shortfall. Training a drafter on this pack would be the experiment. It was not authorized and is not required to *understand* why speculation loses today.
+Published DFlash transfer on a dense target is 4.1–5.5 accepts/pass. 3.00 vs that is the shortfall. LoRA onto this 2-bit teacher did not close it.
 
 ## Packed codes are genuinely ternary — resolved
 
@@ -346,16 +374,16 @@ Not a backlog. These are finished measurements.
 2. **Always-8 + GDN commit.** Not building. Replay=0 still needs 3.26–3.51 accepts; we have 3.00.
 3. **DFlash Q4 MMA.** Draft already 37–46 ms. Skip.
 4. **Five-trit.** HOLD. Global 0.88×; per-shape 0 winners; mixed greedy 10.21.
-5. **Acceptance gap** (3.00 vs published 4.1–5.5). Front-loaded rejects. Would need training. Did not train.
+5. **Acceptance gap** (3.00 vs published 4.1–5.5). Front-loaded rejects. LoRA r=16 on the existing Q4 draft, 5000 steps: held-out **2.09**. Overfit. Stock Q4 remains the dflash default.
 6. **Hybrid CPU/GPU.** Ruled out.
 7. **Chunked GDN.** Same sequential kernel. Ruled out.
 8. Prefill 40.9 vs llama-bench pp512 ~47 — not the chat bottleneck.
 
-Do not: train a drafter, tree attention / EAGLE / Medusa, fuse the Hadamard, port PowerInfer / Deja Vu, rewrite in Swift, WY-chunked GDN, `uint4b` 2-bit padding, hybrid CPU/GPU decode, always-8 GDN commit, five-trit convert, Apple10 persistent-wave policy, post-Hadamard sparsity unless a later owner measures 30%+ droppable with token identity.
+Do not: train a drafter from scratch, tree attention / EAGLE / Medusa, fuse the Hadamard, port PowerInfer / Deja Vu, rewrite in Swift, WY-chunked GDN, `uint4b` 2-bit padding, hybrid CPU/GPU decode, always-8 GDN commit, five-trit convert, Apple10 persistent-wave policy, post-Hadamard sparsity unless a later owner measures 30%+ droppable with token identity. LoRA on the existing draft was the acceptance-gap experiment; it lost.
 
 ## Disk / cleanliness
 
-Source: `~/projects/monkeyinference` (git). Authorized add: **+1.266 GB** Splash `draft/` only. Did not download `target/`, `vision/`, or `incoai/Qwen3.8-27B-DFlash2`. Tokenizer compare used a 20 MB Hub file in `/tmp` and deleted it. Did not delete user data.
+Source: `~/projects/monkeyinference` (git). Authorized add: **+1.266 GB** Splash `draft/` only. Distill cache `~/.monkey/dflash-ft/` is **~322 MB** (aux 288 + adapters 33 + logs); not user data, safe to delete if the bytes are needed. Did not download `target/`, `vision/`, or `incoai/Qwen3.8-27B-DFlash2`. Tokenizer compare used a 20 MB Hub file in `/tmp` and deleted it. Did not delete user data.
 
 Safe to delete if Ashvin wants the bytes back — see the README disk section. The 8.0 GB MLX pack is required to run this engine. The 6.7 GB GGUF and the llama-server on port 8080 are **not** this repo; leave them unless he is done with the llama.cpp path.
 
@@ -378,5 +406,6 @@ Safe to delete if Ashvin wants the bytes back — see the README disk section. T
 - 2026-09-19 **NEW** DFlash break-even with measured draft and replay=0: propose is **37–42 ms flat in K**. No K beats 10.22. Best **9.39 tok/s** at K=7 (3.00 accepts; need **3.26**). Do not build always-8+GDN commit.
 - 2026-09-18 **NEW** Bonsai affine-2bit codes are genuinely **ternary**: **0 / 3.54e9** code-3. Exact-zero (code 1) **32.8%**. **RESOLVED** — five-trit is lossless on the table; unpack vs qdot is a separate (failed) speed question.
 - 2026-09-19 **HOLD** five-trit unpack. Synthetic global switch 0.88×. **Per-shape mix on real weights: 0 winning (N,K)** (1.31–2.14×). Mixed greedy **10.21 tok/s**, leftover-identical. Keep 2-bit. Does not move T=8 MMA.
-- 2026-09-19 **NEW** After mix, break-even still short: T=8 298 ms, need **3.51** accepts, have 3.00, predicted **8.71 tok/s**. DFlash K=7 e2e **5.07 tok/s** with MMA+replay, identity-ok. Rejects front-loaded (19% slot 0, 38% after one). Acceptance gap, not kernels. Did not train.
-- 2026-09-19 **CLOSE** no remaining software path on this Air materially beats ~11 tok/s. Binding constraint is GPU STREAM ~86.6 GB/s. Engine is at the hardware’s greedy limit. Faster means more memory bandwidth (a different Mac) or training a draft — not another kernel in this repo.
+- 2026-09-19 **NEW** After mix, break-even still short: T=8 298 ms, need **3.51** accepts, have 3.00, predicted **8.71 tok/s**. DFlash K=7 e2e **5.07 tok/s** with MMA+replay, identity-ok. Rejects front-loaded (19% slot 0, 38% after one). Acceptance gap, not kernels.
+- 2026-09-19 **NEW** LoRA r=16 distill of Splash DFlash 2 Q4 onto 2-bit Bonsai: 64 sequences / 3032 windows / 5000 steps, identity-safe leftover-greedy verify. Held-out explain **2.09 accepts/pass** vs stock **3.00**. Same-run greedy **10.75**, stock DFlash **5.68**, LoRA **3.68**. Paper K=7 replay=0: pred **6.06** tok/s, need **3.51**. Overfit; adapters opt-in; production dflash stays stock Q4.
+- 2026-09-19 **CLOSE** no remaining software path on this Air materially beats ~11 tok/s. Binding constraint is GPU STREAM ~86.6 GB/s. Engine is at the hardware’s greedy limit. Faster means more memory bandwidth (a different Mac). Training the existing draft with this LoRA recipe did not move the needle the right way.
