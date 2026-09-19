@@ -2,9 +2,9 @@
 
 Living design-and-results doc. Engine repo: [github.com/ashvinar/monkeyinference](https://github.com/ashvinar/monkeyinference) · branch `cursor/ternary-metal-engine-09ea`. Standalone Metal/MLX runtime, not a Splash fork.
 
-**Headline (2026-09-18, evening):** Decode is still DRAM-bandwidth bound. Greedy explain is **9.74 tok/s** (86% of the 11.3 measured-STREAM ceiling). Same-prompt PLD copy is **11.70 vs 8.19 leftover-greedy, 1.43×, 10/10, token-identical**. Self-speculation from the first N∈{2,4,6,8} layers plateaus at **1.07 accepts/pass**.
+**Headline (2026-09-18, night):** Decode is still DRAM-bandwidth bound. Same-run greedy explain is **10.22 tok/s** with Low Power Mode off (the recorded **9.74** is the same band). Leftover greedy on that load is **8.47 tok/s**, not 2.77 — the 3.5× leftover drop was **Low Power Mode**, not the DFlash residual.
 
-The cheaper draft lead is **in**. Official Splash `draft/` (`incoai/Qwen3.8-27B-Splash`) is 5 layers, **1.266 GB**, vocab **248320** and hidden **5120** matching Bonsai. Unpacked `MDFD0004` Q4 into MLX affine-4bit. On the explain prompt, DFlash 2 leftover-verify is **3.00 accepts/pass** (32 accepted / 103 proposed, 16 verify passes for 48 tokens), **token-identical** to leftover greedy. That is the chat number early-exit never reached. The dflash *loop* is not yet a tok/s win (0.80 vs leftover 2.77 this run) because context KV is rebuilt every propose and rejects still replay — implementation tax, not a modelling wall. Training a new draft is not required to clear 2× accepts/pass.
+DFlash 2 still transfers at **3.00 accepts/pass** (K=7, 32/103, token-identical). The loop is no longer 0.80 tok/s: incremental draft KV, skip-`lm_head` replay, and K=2 (matching typical leftover+2 accepts) reach **7.32 tok/s**. That does **not** beat 9.74. Target verify is **114 ms at T=1 vs 553 ms at T=8** because GDN compute scales with T; AuxCapture is free. fp16 residual is finite after fp32 `o_proj` accum but `|h|≈53k` (fp16 ULP 32) yields **0 accepts**. Residual stays float32 because the magnitude requires it.
 
 ## Machine
 
@@ -56,7 +56,7 @@ Prism's own laptop table (PQ2_0 GGUF, no speculation): M4 Pro 18 tok/s, M5 Pro 2
 | GDN cache pin is copy-on-write, not memcpy | `gated_delta` already writes a new `state_out`; `GatedDeltaNet` does `cache[i] = new`. Holding the previous array refs / KV offsets is a real CoW pin (~151 MB × 48 layers is **not** copied). Partial reject reverts pointers and replays leftover+accepted (GDN is recurrent; no per-timestep states). | If Apple adds trimmable GDN cache, switch. |
 | First draft = prompt-lookup n-gram (PLD), K=5 | Zero extra weights. K=8+ over-proposes on the copy sentence and pays reject+replay. | Tune K per prompt class. |
 | Self-spec draft = first N layers + shared `lm_head` | Vocab 248320 matches by construction; 0 new bytes. N∈{2,4,6,8} all plateau at ~1.07 accepts/pass. | Do not tune N further. |
-| Chat draft = Splash DFlash 2 `draft/` | Official 5-layer block-diffusion drafter trained on Qwen3.8-27B. Vocab/hidden match. Context is concatenated Bonsai hiddens at layers 5/19/33/47/61. Logits use Bonsai's `lm_head`. Residual stream kept float32 (Q4 o_proj biases overflow fp16). | `--draft dflash`. Do not download the 17.4 GB Splash package or the 3.85 GB BF16 DFlash2 repo. |
+| Chat draft = Splash DFlash 2 `draft/` | Official 5-layer block-diffusion drafter trained on Qwen3.8-27B. Vocab/hidden match. Context is concatenated Bonsai hiddens at layers 5/19/33/47/61. Logits use Bonsai's `lm_head`. Residual **must** stay float32: `|h|≈5e4` (fp16 ULP 32) zeros the draft even when finite. Default verify K=2 (GDN cost scales with T; typical accept is leftover+2). Draft KV is incremental; query KV is pinned and dropped; reject replay skips `lm_head`. | `--draft dflash --num-draft 7` for the 3.00 accepts/pass number. Do not download the 17.4 GB Splash package or the 3.85 GB BF16 DFlash2 repo. |
 | Correctness gates in the bench loop | Packing vs `dequantize`; greedy `Paris` + speculative-decoding explanation; **argmax spec tokens == leftover-greedy tokens** on copy and explain. | Token-level logit KL vs Prism if a claim depends on 0.1 tok/s. |
 
 ## Benchmark progression
@@ -99,17 +99,33 @@ Hub listing first. Whole package 17.4 GB; **not downloaded**. `draft/` is 6 file
 
 Unpack: scatter StorageN tiles → MLX affine-4bit (`dequant = scale*q + bias`, 8 nibbles/uint32, low first). Section accounting matches the 187,449,344 B layer files and 328,794,112 B `model.bin` exactly. Synthetic pack/unpack vs numpy max abs 0.044.
 
-Explain prompt, leftover protocol, 48 gen tokens, argmax, token-identical to leftover greedy:
+Explain prompt, leftover protocol, 48 gen tokens, argmax, **Low Power Mode off**, token-identical to leftover greedy and to stream greedy:
 
-| Engine | Accepts/pass | Accepted/proposed | Verify passes | Decode tok/s | Peak |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| leftover greedy | 1.00 | 0 / 0 | 48 | 2.77 | 8.28 GB |
-| early-exit N=4 | 1.07 | 3 / 170 | — | 1.93 | — |
-| **DFlash 2** | **3.00** | **32 / 103** | **16** | 0.80 | **9.54 GB** |
+| Engine | K | Accepts/pass | Accepted/proposed | Verify passes | Decode tok/s | draft/verify/replay s |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| stream greedy (same load) | — | 1.00 | — | 48 | **10.22** | — |
+| leftover greedy | — | 1.00 | 0 / 0 | 48 | 8.47 | 0 / 5.66 / 0 |
+| DFlash 2 | 7 | **3.00** | **32 / 103** | 16 | 3.99 | 1.31 / 8.21 / 2.49 |
+| DFlash 2 | 3 | 2.53 | 29 / 55 | 19 | 7.03 | 1.08 / 4.37 / 1.37 |
+| **DFlash 2 (default)** | **2** | **2.29** | **27 / 41** | **21** | **7.32** | 1.38 / 3.77 / 1.39 |
 
-3.00 is committed tokens per target pass (accepted drafts + leftover/bonus). Published DFlash 2 on matching dense Qwen3.8-27B is ~4.1–5.5; Bonsai is ternary Hadamard, so 3.0 on explain is the transfer number. fp16 residuals proposed `[0,0,0,…]` (`!!!!!!!`); float32 residuals proposed the greedy continuation on the first step (`Speculative decoding is a technique that`).
+The leftover **2.77 tok/s** in the earlier DFlash table was the same Air with `lowpowermode 1` on battery. Same-run greedy was 2.78. STREAM was still 79 GB/s; GPU clocks were not. That is not an fp32-residual tax on leftover — leftover never runs the draft.
 
-The 0.80 tok/s is **not** the claim. Propose currently rebuilds draft KV from the full aux context every step and pays reject+replay. Accepts/pass is the number that decided the lead.
+fp32 `o_proj` accum + **fp16 residual** is finite (`|h|≈53085 < 65504`) and **wrong**: 0/308 drafts accepted. fp16 ULP at 5e4 is 32. Residual stays float32 because the magnitude requires it, not because we failed to isolate the bias.
+
+Target forward time after a short prefill, CoW-pinned (no aux tax — taps add 0 ms):
+
+| M (leftover+drafts) | median |
+| ---: | ---: |
+| 1 | 114.5 ms |
+| 2 | 140.4 ms |
+| 3 | 190.0 ms |
+| 4 | 253.6 ms |
+| 8 | 553.3 ms |
+
+Weight-once qdot does not make T=8 as cheap as T=1. 48 GDN layers loop T in the Metal kernel. Default K=2 is leftover+2 = T=3 (~190 ms), which matches the K=7 transfer (leftover+2 accepted of 7). Incremental draft KV cut propose from 9.6 s → 1.3–1.4 s. Replay skips `lm_head`. **7.32 tok/s does not beat 9.74 / 10.22.** Ceiling if replay vanished at K=2 is ~9.3 tok/s; the remaining wall is GDN T-scaling, not KV rebuild.
+
+3.00 accepts/pass (K=7) is still the modelling number. Published DFlash 2 on dense Qwen3.8-27B is ~4.1–5.5.
 
 ### Microbench (no 27B load)
 
@@ -132,7 +148,7 @@ MLX itself will not switch `qmv`→`qmm` on Bonsai MLP-up until M≈12. Spec lef
   - leftover greedy == `mlx_lm.stream_generate` on Paris
   - leftover greedy == PLD on the copy prompt
   - leftover greedy == early-exit N=4 on explain (48 tok)
-  - leftover greedy == DFlash 2 on explain (48 tok, `identity_ok`)
+  - leftover greedy == DFlash 2 on explain (48 tok, K∈{2,3,7}, also == stream greedy)
 
 A fast engine emitting plausible-looking noise, or a spec loop that silently diverges on reject, would have failed this loop. It did not.
 
@@ -172,7 +188,7 @@ Uses the existing `~/.monkey/mlx-venv` (mlx 0.32.0). No second venv. `--no-custo
 
 ## What's left
 
-1. **Make DFlash tok/s follow accepts/pass.** 3.00 accepts/pass on explain is enough. The loop still rebuilds draft KV every propose and replays on partial reject, so 0.80 tok/s is not a speed claim. Persist draft cache, STREAM the Q4 projections, then re-bench.
+1. **Beat greedy 10.22 / 9.74 in wall clock.** K=2 is 7.32 tok/s, identity-ok. Incremental KV and skip-`lm_head` replay are in. The remaining tax is GDN T-scaling on the *target* (114 ms at T=1 vs 190 ms at T=3 vs 553 ms at T=8) plus leftover+accepted replay on partial reject. A GDN kernel that does not cost ~linear in T, or a trimmable GDN pin after leftover, is the next speed lever — not another draft.
 2. **Prefill.** 40.9 tok/s vs llama-bench pp512 47. Still the compute-bound side; not the chat bottleneck.
 3. Tokenizer regex; sampling; optional vision.
 4. If traces after the qdot pass still show Python dispatch in the hot path, move the layer loop to compiled Metal. GEMV is now ~82–86% of measured STREAM, so that is second-order.
@@ -188,5 +204,8 @@ Added: git repo under `~/projects/monkeyinference` (source). **+1.266 GB** at `~
 - 2026-09-18 **UPDATE** custom qdot GEMV **is** production decode. `--no-custom` remains the Prism MLX path. Layer vs MLX max_abs 0.013; greedy tokens match.
 - 2026-09-18 **UPDATE** Ashvin authorized Splash `draft/` bytes. Fetched **1.266 GB** only. Vocab/hidden match. Do **not** fetch the 17.4 GB package or the 3.85 GB BF16 DFlash2 repo.
 - 2026-09-18 **HOLD** self-speculation with first N layers + shared `lm_head` plateaus at **1.07 accepts/pass** for N∈{2,4,6,8}.
-- 2026-09-18 **NEW** Splash DFlash 2 on Bonsai explain is **3.00 accepts/pass**, token-identical to leftover greedy. Modelling lead **ruled in**. Training is not required to clear 2×. Next cost is making the dflash loop STREAM-bound, not a new draft.
+- 2026-09-18 **NEW** Splash DFlash 2 on Bonsai explain is **3.00 accepts/pass**, token-identical to leftover greedy. Modelling lead **ruled in**. Training is not required to clear 2×.
 - 2026-09-18 **NEW** GDN snapshot tax is gone (CoW pin). Weight-once verify is why PLD copy is 11.70 vs 8.19 leftover greedy, not 7.7 vs 8.4.
+- 2026-09-18 **HOLD** leftover 2.77 vs greedy 9.74 was **Low Power Mode**, not the DFlash residual. Same-run leftover 8.47 vs greedy 10.22 with LPM off. Leftover never runs the draft stream.
+- 2026-09-18 **HOLD** DFlash residual is float32 because `|h|≈5e4`. fp32 `o_proj` accum + fp16 store is finite and drops accepts to 0 (fp16 ULP 32). That is as narrow as the overflow/precision actually requires.
+- 2026-09-18 **UPDATE** DFlash loop: incremental context KV, query pin, replay without `lm_head`, default K=2. Explain tok/s **7.32** (K=7 still 3.00 accepts/pass at 3.99 tok/s). Does not beat 9.74. Next wall is GDN T-scaling on target verify.

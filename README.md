@@ -16,7 +16,7 @@ Bonsai's geometry matches Qwen3.8-27B, but Splash only loads `splash-packed-q4` 
 - Greedy decode, leftover-greedy, prompt-lookup speculative decode, early-exit self-speculation, and Splash DFlash 2 leftover-verify
 - Coherence + token-identity gates wired into `monkeyinference bench`
 
-On this Air, greedy explain is **9.74 tok/s**. Same-prompt PLD copy is **11.70 tok/s vs 8.19 leftover greedy** (10/10 accept, token-identical). Early-exit self-speculation plateaus at **1.07 accepts/pass**. Official Splash DFlash 2 `draft/` (1.266 GB, vocab/hidden match) transfers to ternary Bonsai at **3.00 accepts/pass** on the explain prompt, token-identical to leftover greedy. The dflash *loop* is not yet a tok/s win (0.80 vs leftover 2.77) — that is rebuild-KV / replay tax, not a modelling miss. Training a new draft is not required to clear 2× accepts/pass.
+On this Air, greedy explain is **9.74–10.22 tok/s** (Low Power Mode off). Same-prompt PLD copy is **11.70 tok/s vs 8.19 leftover greedy** (10/10 accept, token-identical). Early-exit self-speculation plateaus at **1.07 accepts/pass**. Official Splash DFlash 2 `draft/` transfers at **3.00 accepts/pass** (K=7) and **7.32 tok/s** at default K=2 on the explain prompt, token-identical to greedy. That does not yet beat greedy in wall clock: target GDN cost scales with T (114 ms at T=1 vs 553 ms at T=8). Training a new draft is not required to clear 2× accepts/pass.
 
 ## Run
 
@@ -33,7 +33,7 @@ export PYTHONPATH=src
 ~/.monkey/mlx-venv/bin/python -m monkeyinference.cli bench --dflash --out results/dflash.json
 ```
 
-`--no-custom` forces MLX affine matmul. `--draft early --early-layers 4` is self-speculation (plateaued; do not tune N further). `--draft dflash` uses the Splash DFlash 2 Q4 pack at `~/.monkey/models/Qwen3.8-27B-Splash-draft/draft/`.
+`--no-custom` forces MLX affine matmul. `--draft early --early-layers 4` is self-speculation (plateaued; do not tune N further). `--draft dflash` uses the Splash DFlash 2 Q4 pack at `~/.monkey/models/Qwen3.8-27B-Splash-draft/draft/` (default `--num-draft 2`; `--num-draft 7` is the 3.00 accepts/pass setting).
 
 Bonsai weights are expected at `~/.monkey/models/Ternary-Bonsai-2-27B-mlx-2bit/` (already on this machine). The DFlash draft was fetched as `draft/` only (1.266 GB); the 17.4 GB Splash package and the 3.85 GB BF16 DFlash2 repo were not downloaded.
 

@@ -285,14 +285,36 @@ def run_dflash_bench(pack: str | Path | None = None) -> dict:
     from monkeyinference.dflash import load_drafter
 
     load_drafter()
-    dflash = generate(
-        loaded,
-        EXPLAIN_PROMPT,
-        max_tokens=48,
-        speculative=True,
-        draft="dflash",
-        parity_layers=0,
-    )
+    dflash_rows = {}
+    for k in (2, 3, 7):
+        row = generate(
+            loaded,
+            EXPLAIN_PROMPT,
+            max_tokens=48,
+            speculative=True,
+            draft="dflash",
+            num_draft=k,
+            parity_layers=0,
+        )
+        dflash_rows[k] = row
+    k_sweep = {
+        str(k): {
+            "generation_tps": row.generation_tps,
+            "accepts_per_pass": row.accepts_per_pass,
+            "accepted_draft": row.accepted_draft,
+            "proposed_draft": row.proposed_draft,
+            "verify_passes": row.verify_passes,
+            "draft_s": row.draft_s,
+            "verify_s": row.verify_s,
+            "replay_s": row.replay_s,
+            "token_identity": _tokens_match(leftover.tokens, row.tokens),
+            "beats_greedy": row.generation_tps > greedy.generation_tps,
+            "beats_974": row.generation_tps > 9.74,
+        }
+        for k, row in dflash_rows.items()
+    }
+    best_k = max(dflash_rows, key=lambda k: dflash_rows[k].generation_tps)
+    dflash = dflash_rows[best_k]
     identity_left = _tokens_match(leftover.tokens, dflash.tokens)
     identity_greedy = _tokens_match(greedy.tokens, dflash.tokens)
     identity = identity_left and identity_greedy
@@ -310,6 +332,8 @@ def run_dflash_bench(pack: str | Path | None = None) -> dict:
         "greedy": _payload(greedy),
         "leftover": _payload(leftover),
         "dflash": _payload(dflash),
+        "dflash_k": best_k,
+        "k_sweep": k_sweep,
         "accepts_per_pass": dflash.accepts_per_pass,
         "accepted_draft": dflash.accepted_draft,
         "proposed_draft": dflash.proposed_draft,
