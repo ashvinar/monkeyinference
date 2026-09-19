@@ -329,11 +329,43 @@ class DFlashDrafter:
 _DRAFTER: DFlashDrafter | None = None
 
 
-def load_drafter(directory: str | Path | None = None) -> DFlashDrafter:
-    """Load once. Draft Q4 unpack is ~1.3 GB and should not hit the generate timer twice."""
+def reset_drafter() -> None:
+    """Drop the process-wide draft so the next load can pick up adapters."""
+    global _DRAFTER
+    _DRAFTER = None
+
+
+def load_drafter(
+    directory: str | Path | None = None,
+    *,
+    adapter_path: str | Path | bool | None = None,
+) -> DFlashDrafter:
+    """Load once. Draft Q4 unpack is ~1.3 GB and should not hit the generate timer twice.
+
+    adapter_path:
+      None  — load ~/.monkey/dflash-ft/adapters.safetensors if it exists
+      False — never load adapters (training)
+      Path  — load that file
+    """
     global _DRAFTER
     if _DRAFTER is None:
         _DRAFTER = DFlashDrafter(load_dflash_draft(directory))
+        path = None
+        if adapter_path is False:
+            path = None
+        elif adapter_path is None:
+            from monkeyinference.dflash_lora import DEFAULT_ADAPTERS
+
+            path = DEFAULT_ADAPTERS if DEFAULT_ADAPTERS.is_file() else None
+        else:
+            path = Path(adapter_path)
+        if path is not None:
+            from monkeyinference.dflash_lora import load_adapters, wrap_drafter
+
+            adapters = wrap_drafter(_DRAFTER)
+            load_adapters(adapters, path)
+            _DRAFTER._adapters = adapters
+            print(f"loaded DFlash LoRA adapters from {path}", flush=True)
     else:
         _DRAFTER.reset_cache()
     return _DRAFTER

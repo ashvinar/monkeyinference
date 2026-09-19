@@ -10,13 +10,14 @@ These scripts produced the tables in `docs/ternary-engine.md`. They are not part
 | `probe_bandwidth.py` | GPU copy/read/write STREAM, CPU read, CPU+GPU aggregate |
 | `probe_code_histogram.py` | On-disk affine-2bit codes: 0 of 3.54e9 code-3 |
 | `probe_gdn_path.py` | mlx_lm GDN prefill vs verify: same sequential kernel |
-| `probe_qmm_m8.py` | 8-row MMA vs qdot on MLP-up |
+| `finetune_dflash.py` | LoRA distill of DFlash onto 2-bit Bonsai (see `docs/ternary-engine.md`) |
 
 ```bash
 export PYTHONPATH=src
 ~/.monkey/mlx-venv/bin/python scripts/probe_code_histogram.py
 ~/.monkey/mlx-venv/bin/python scripts/probe_bandwidth.py
 ~/.monkey/mlx-venv/bin/python scripts/probe_mixed.py
+~/.monkey/mlx-venv/bin/python scripts/finetune_dflash.py --scope
 ```
 
 `results/*.json` is gitignored. One-off kernel-tuning probes on disk are not tracked.
