@@ -153,11 +153,14 @@ class DFlashDrafter:
     def bytes_on_disk(self) -> int:
         return self.w.bytes_on_disk
 
+    def _q4(self, lin, x: mx.array) -> mx.array:
+        return lin(x.astype(mx.float16)).astype(mx.float32)
+
     def _conv_pair(self, hidden: mx.array, dynamic: mx.array, base: mx.array):
         # dynamic: [T, 1280] = 2 sides × 2 taps × 320 groups
         t = int(hidden.shape[0])
         coeff = dynamic.reshape(t, 2, CONV_TAPS, HIDDEN // CONV_GROUP)
-        prepared = grouped_conv(hidden, coeff[:, 0], base[0])
+        prepared = grouped_conv(hidden, coeff[:, 0], base[0].astype(hidden.dtype))
         return prepared, coeff[:, 1]
 
     def _split_qkv(self, qkv: mx.array):
@@ -178,23 +181,23 @@ class DFlashDrafter:
         """Project captured target hiddens and write draft K/V (no query)."""
         if aux.ndim == 3:
             aux = aux.reshape(-1, TARGET_HIDDEN)
-        projected = self.w.context_proj(aux)
+        projected = self._q4(self.w.context_proj, aux)
         hidden = rms_norm(projected, self.w.hidden_norm)
         t = int(hidden.shape[0])
         for layer, c in zip(self.w.layers, cache):
-            qkv = layer.qkv(hidden)
+            qkv = self._q4(layer.qkv, hidden)
             _, k, v = self._split_qkv(qkv)
             k = rms_norm(k.reshape(t, self.n_kv, self.head_dim), layer.k_norm).reshape(
                 t, self.kv_size
             )
-            keys = self._heads(k, self.n_kv)
-            values = self._heads(v, self.n_kv)
+            keys = self._heads(k, self.n_kv).astype(mx.float16)
+            values = self._heads(v, self.n_kv).astype(mx.float16)
             keys = self.rope(keys, offset=c.offset)
             c.update_and_fetch(keys, values)
 
     def _attn(self, hidden: mx.array, layer, cache) -> mx.array:
         t = int(hidden.shape[0])
-        qkv = layer.qkv(hidden)
+        qkv = self._q4(layer.qkv, hidden)
         q, k, v = self._split_qkv(qkv)
         q = rms_norm(q.reshape(t, self.n_heads, self.head_dim), layer.q_norm).reshape(
             t, self.q_size
@@ -202,36 +205,39 @@ class DFlashDrafter:
         k = rms_norm(k.reshape(t, self.n_kv, self.head_dim), layer.k_norm).reshape(
             t, self.kv_size
         )
-        queries = self.rope(self._heads(q, self.n_heads), offset=cache.offset)
-        keys = self.rope(self._heads(k, self.n_kv), offset=cache.offset)
-        values = self._heads(v, self.n_kv)
+        queries = self.rope(self._heads(q, self.n_heads).astype(mx.float16), offset=cache.offset)
+        keys = self.rope(self._heads(k, self.n_kv).astype(mx.float16), offset=cache.offset)
+        values = self._heads(v, self.n_kv).astype(mx.float16)
         keys, values = cache.update_and_fetch(keys, values)
-        # Bidirectional over the query block; full attend to committed context.
         out = mx.fast.scaled_dot_product_attention(
-            queries, keys, values, scale=self.scale, mask=None
+            queries.astype(mx.float32),
+            keys.astype(mx.float32),
+            values.astype(mx.float32),
+            scale=self.scale,
+            mask=None,
         )
-        return layer.o_proj(self._from_heads(out))
+        return self._q4(layer.o_proj, self._from_heads(out))
 
     def _mlp(self, hidden: mx.array, layer) -> mx.array:
-        gate = layer.gate(hidden)
-        up = layer.up(hidden)
-        return layer.down(nn.silu(gate) * up)
+        gate = self._q4(layer.gate, hidden)
+        up = self._q4(layer.up, hidden)
+        return self._q4(layer.down, nn.silu(gate) * up)
 
     def backbone(self, hidden: mx.array, cache: list) -> mx.array:
-        """hidden: [T, H] query rows. Mutates `cache`."""
-        h = hidden
+        """hidden: [T, H] query rows. Mutates `cache`. Residual stream is float32."""
+        h = hidden.astype(mx.float32)
         for layer, c in zip(self.w.layers, cache):
             residual = h
             n = rms_norm(h, layer.input_norm)
-            n, coeff = self._conv_pair(n, layer.attn_dynamic(n), layer.attn_conv)
+            n, coeff = self._conv_pair(n, self._q4(layer.attn_dynamic, n), layer.attn_conv)
             a = self._attn(n, layer, c)
-            a = grouped_conv(a, coeff, layer.attn_conv[1])
+            a = grouped_conv(a, coeff, layer.attn_conv[1].astype(a.dtype))
             h = residual + a
             residual = h
             n = rms_norm(h, layer.post_attn_norm)
-            n, coeff = self._conv_pair(n, layer.mlp_dynamic(n), layer.mlp_conv)
+            n, coeff = self._conv_pair(n, self._q4(layer.mlp_dynamic, n), layer.mlp_conv)
             m = self._mlp(n, layer)
-            m = grouped_conv(m, coeff, layer.mlp_conv[1])
+            m = grouped_conv(m, coeff, layer.mlp_conv[1].astype(m.dtype))
             h = residual + m
         return rms_norm(h, self.w.final_norm)
 
@@ -253,7 +259,7 @@ class DFlashDrafter:
             succ = self.w.successor[mx.array(cand, dtype=mx.uint32)]
             pred = self.w.predecessor[prev]
             h = hidden[i]
-            scores = unary + (pred * h) @ succ.T
+            scores = unary.astype(mx.float32) + (pred * h).astype(mx.float32) @ succ.astype(mx.float32).T
             mx.eval(scores)
             idx = int(mx.argmax(scores).item())
             tok = cand[idx]
@@ -278,10 +284,10 @@ class DFlashDrafter:
         if hidden.ndim == 3:
             hidden = hidden.reshape(hidden.shape[1], hidden.shape[2])
         hidden = self.backbone(hidden, cache)
-        logits = lm_head(hidden)
-        sel_h = self.w.selector(hidden)
+        logits = lm_head(hidden.astype(mx.float16))
+        sel_h = self._q4(self.w.selector, hidden)
         mx.eval(logits, sel_h)
-        return self.select(logits, sel_h, leftover_token, k)
+        return self.select(logits.reshape(int(logits.shape[-2]), int(logits.shape[-1])), sel_h, leftover_token, k)
 
 
 def load_drafter(directory: str | Path | None = None) -> DFlashDrafter:
