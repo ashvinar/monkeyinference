@@ -2,9 +2,9 @@
 
 Living design-and-results doc. Engine repo: [github.com/ashvinar/monkeyinference](https://github.com/ashvinar/monkeyinference) · branch `cursor/ternary-metal-engine-09ea`. Standalone Metal/MLX runtime, not a Splash fork.
 
-**Headline (2026-09-18, night):** Decode is still DRAM-bandwidth bound. Same-run greedy explain is **10.22 tok/s** with Low Power Mode off (the recorded **9.74** is the same band). Leftover greedy on that load is **8.47 tok/s**, not 2.77 — the 3.5× leftover drop was **Low Power Mode**, not the DFlash residual.
+**Headline (2026-09-18, night):** Decode is still DRAM-bandwidth bound. Same-run greedy explain is **10.22 tok/s** with Low Power Mode **off**. Leftover greedy on that load is **8.47 tok/s**. The leftover **2.77** / DFlash **0.80** pair was `lowpowermode 1` — marked below, not comparable to 10.22.
 
-DFlash 2 still transfers at **3.00 accepts/pass** (K=7, 32/103, token-identical). The loop is no longer 0.80 tok/s: incremental draft KV, skip-`lm_head` replay, and K=2 (matching typical leftover+2 accepts) reach **7.32 tok/s**. That does **not** beat 9.74. Target verify is **114 ms at T=1 vs 553 ms at T=8** because GDN compute scales with T; AuxCapture is free. fp16 residual is finite after fp32 `o_proj` accum but `|h|≈53k` (fp16 ULP 32) yields **0 accepts**. Residual stays float32 because the magnitude requires it.
+DFlash 2 transfers at **3.00 accepts/pass** (K=7, token-identical). Default K=2 is **7.32 tok/s** and does **not** beat 10.22. Prefill and leftover+K verify already share one GDN path: mlx_lm's Metal `gated_delta_kernel`, **48 calls per forward**, `for (int t = 0; t < T; ++t)` inside a single launch, `ArraysCache` written once. There is no chunkwise-parallel WY form in this implementation. Isolated 48-layer GDN is **30 ms at T=1 and 65 ms at T=8** — 12% of the 550 ms T=8 forward. The other 88% is 401 weight-once ternary GEMVs. Forcing those onto the prefill `qmm` path makes T=8 **slower** (863 ms). Prefill's 24 ms/token is large-M qmm amortizing 7.25 GB over T=512, which leftover+K cannot inherit. Speculative decode is a poor fit for this 48-of-64 GDN + ternary-2bit pack on this Air.
 
 ## Machine
 
@@ -71,10 +71,10 @@ Greedy, thinking off, temp 0. Same prompts as the Splash-investigation table unl
 | monkeyinference greedy explain (milestone 1, MLX affine) | 32 | 59 | 33.1 | **8.38** | 8.25 GB | same idea, coherent |
 | monkeyinference greedy long (milestone 1) | 717 | 60 | **41.6** | 8.22 | 10.42 GB | same two-sentence explanation |
 | monkeyinference PLD copy (milestone 1, GDN memcpy) | 46 | 14 | 32.0 | 7.72 | 8.33 GB | exact copy; 10/10 accept; **slower than greedy** |
-| **greedy explain (qdot, this pass)** | 32 | 59 | 34.1 | **9.74** | **8.24 GB** | same Prism explanation, token-stable |
-| **greedy long (qdot)** | 717 | 60 | **40.9** | 9.33 | 10.41 GB | same two-sentence idea |
-| **leftover greedy copy (fair baseline)** | 46 | 14 | 30.1 | **8.19** | 8.38 GB | exact copy |
-| **PLD copy (CoW + weight-once qdot)** | 46 | 14 | 29.9 | **11.70** | 8.38 GB | exact copy; **10/10**; **1.43× vs leftover greedy**; token-identical |
+| **greedy explain (qdot, LPM off)** | 32 | 59 | 34.1 | **9.74** | **8.24 GB** | same Prism explanation, token-stable |
+| **greedy long (qdot, LPM off)** | 717 | 60 | **40.9** | 9.33 | 10.41 GB | same two-sentence idea |
+| **leftover greedy copy (LPM off)** | 46 | 14 | 30.1 | **8.19** | 8.38 GB | exact copy |
+| **PLD copy (CoW + weight-once, LPM off)** | 46 | 14 | 29.9 | **11.70** | 8.38 GB | exact copy; **10/10**; **1.43× vs leftover greedy**; token-identical |
 
 Starting point for this project: **8 tok/s decode, ~40 tok/s prefill**. Current greedy: **9.74 / 40.9**. Current same-prompt PLD: **11.70 vs 8.19**. 2-token `Paris` rows still read ~19 tok/s (kernel launch + EOS). Ignore them.
 
@@ -123,9 +123,53 @@ Target forward time after a short prefill, CoW-pinned (no aux tax — taps add 0
 | 4 | 253.6 ms |
 | 8 | 553.3 ms |
 
-Weight-once qdot does not make T=8 as cheap as T=1. 48 GDN layers loop T in the Metal kernel. Default K=2 is leftover+2 = T=3 (~190 ms), which matches the K=7 transfer (leftover+2 accepted of 7). Incremental draft KV cut propose from 9.6 s → 1.3–1.4 s. Replay skips `lm_head`. **7.32 tok/s does not beat 9.74 / 10.22.** Ceiling if replay vanished at K=2 is ~9.3 tok/s; the remaining wall is GDN T-scaling, not KV rebuild.
+Weight-once qdot does not make T=8 as cheap as T=1. Default K=2 is leftover+2 = T=3 (~190 ms). Incremental draft KV cut propose from 9.6 s → 1.3–1.4 s. Replay skips `lm_head`. **7.32 tok/s does not beat 10.22.**
 
-3.00 accepts/pass (K=7) is still the modelling number. Published DFlash 2 on dense Qwen3.8-27B is ~4.1–5.5.
+### GDN path: prefill and verify are the same sequential kernel
+
+mlx_lm `Qwen3_5.GatedDeltaNet.__call__` always calls `gated_delta_update` → Metal `gated_delta_kernel` (`use_kernel=not self.training`). The kernel source is one threadgroup per `(batch, value-head)` with an explicit
+
+```c
+for (int t = 0; t < T; ++t) { /* decay, delta, write y[t] */ }
+```
+
+The ops fallback is documented as “prompt prefill (sequential loop)” and does `for t in range(T)`. There is no chunkwise-parallel / WY / block-scan form in mlx_lm 0.31.3.
+
+Hooked on a real Bonsai forward (LPM off):
+
+| Forward | Calls | unique T | kernel? | wall |
+| --- | ---: | --- | --- | ---: |
+| leftover prefill (31 tok) | 48 | {31} | yes | 0.88 s |
+| T=1 decode | 48 | {1} | yes | 132 ms |
+| T=8 leftover+K | 48 | {8} | yes | 582 ms |
+
+`ArraysCache` is written once per forward (`cache[1] = state`; `cache.advance(S)`), not once per token. Verify is not stepping GDN in Python.
+
+Isolated `gated_delta_kernel` at Bonsai shapes (Hv=48, Dv=Dk=128), ×48 layers:
+
+| T | ms / 48 layers | ms / token |
+| ---: | ---: | ---: |
+| 1 | 30.2 | 30.3 |
+| 8 | 65.0 | 8.1 |
+| 64 | 167.4 | 2.6 |
+| 512 | 295.9 | 0.58 |
+
+GDN is **65 ms of a 550 ms T=8 model forward** (12%). T=8 path counts: **401× `ternary_qmv_once`, 0× qmm**. Forcing leftover+K onto the prefill linear path (`mx.quantized_matmul`) makes T=8 **863 ms** (MLX stays on `qmv` until M≈12 and re-streams). Prefill 40.9 tok/s (~24 ms/token on 717 tok) is large-M qmm amortizing 7.25 GB over T=512 plus GDN at 0.58 ms/token. Leftover+K cannot take that deal.
+
+Kernel vs ops on one layer: T=1 y max-abs 1.2e-4; T=8 y max-abs 0.031 (fp16). Same recurrence.
+
+**Ruling:** a chunked verify that is just “the prefill GDN path” does not exist as a second implementation. A trainable WY-chunked gated-delta kernel would be new work, would still leave 401 ternary GEMVs, and is out of scope. Speculative leftover+K is a poor fit for this 48-of-64 GDN + 2-bit pack on this Air. That is the finding, not a failed optimization.
+
+### LPM-throttled rows (do not compare to 10.22)
+
+Measured with `lowpowermode 1` on battery. STREAM was still ~79 GB/s; GPU clocks were not.
+
+| Engine | tok/s | Notes |
+| --- | ---: | --- |
+| leftover greedy explain | 2.77 | same process greedy 2.78 |
+| DFlash K=7 first loop | 0.80 | 3.00 accepts/pass, identity-ok; rebuild KV |
+
+The 9.74 greedy / 11.70 PLD table above was LPM off (same band as 10.22).
 
 ### Microbench (no 27B load)
 
@@ -188,10 +232,9 @@ Uses the existing `~/.monkey/mlx-venv` (mlx 0.32.0). No second venv. `--no-custo
 
 ## What's left
 
-1. **Beat greedy 10.22 / 9.74 in wall clock.** K=2 is 7.32 tok/s, identity-ok. Incremental KV and skip-`lm_head` replay are in. The remaining tax is GDN T-scaling on the *target* (114 ms at T=1 vs 190 ms at T=3 vs 553 ms at T=8) plus leftover+accepted replay on partial reject. A GDN kernel that does not cost ~linear in T, or a trimmable GDN pin after leftover, is the next speed lever — not another draft.
-2. **Prefill.** 40.9 tok/s vs llama-bench pp512 47. Still the compute-bound side; not the chat bottleneck.
+1. **Speculation vs this pack.** DFlash K=2 is 7.32 tok/s, identity-ok, and does not beat greedy 10.22. Prefill and verify share sequential GDN; leftover+K cannot inherit T=512 qmm. A WY-chunked GDN kernel is new work and would not move the 401 GEMVs that dominate T=8. Chat speculation on this Air is a poor fit; PLD copy (11.70) remains the only tok/s win, because the prompt is copyable.
+2. **Prefill.** 40.9 tok/s vs llama-bench pp512 47. Compute-bound qmm + sequential GDN at large T; not the chat bottleneck.
 3. Tokenizer regex; sampling; optional vision.
-4. If traces after the qdot pass still show Python dispatch in the hot path, move the layer loop to compiled Metal. GEMV is now ~82–86% of measured STREAM, so that is second-order.
 
 ## Disk / cleanliness
 
@@ -208,4 +251,5 @@ Added: git repo under `~/projects/monkeyinference` (source). **+1.266 GB** at `~
 - 2026-09-18 **NEW** GDN snapshot tax is gone (CoW pin). Weight-once verify is why PLD copy is 11.70 vs 8.19 leftover greedy, not 7.7 vs 8.4.
 - 2026-09-18 **HOLD** leftover 2.77 vs greedy 9.74 was **Low Power Mode**, not the DFlash residual. Same-run leftover 8.47 vs greedy 10.22 with LPM off. Leftover never runs the draft stream.
 - 2026-09-18 **HOLD** DFlash residual is float32 because `|h|≈5e4`. fp32 `o_proj` accum + fp16 store is finite and drops accepts to 0 (fp16 ULP 32). That is as narrow as the overflow/precision actually requires.
-- 2026-09-18 **UPDATE** DFlash loop: incremental context KV, query pin, replay without `lm_head`, default K=2. Explain tok/s **7.32** (K=7 still 3.00 accepts/pass at 3.99 tok/s). Does not beat 9.74. Next wall is GDN T-scaling on target verify.
+- 2026-09-18 **UPDATE** DFlash loop: incremental context KV, query pin, replay without `lm_head`, default K=2. Explain tok/s **7.32** (K=7 still 3.00 accepts/pass at 3.99 tok/s). Does not beat 10.22.
+- 2026-09-18 **HOLD** mlx_lm GDN prefill and verify are the **same sequential kernel**. 48 calls/forward, `ArraysCache` once, isolated GDN 30 ms (T=1) / 65 ms (T=8) of a 550 ms T=8 forward. Prefill 24 ms/token is large-M qmm, not a second GDN algorithm. Forcing leftover+K onto qmm regresses T=8 to 863 ms. Speculative leftover+K is a poor fit for this 48-of-64 GDN + 2-bit pack on this Air.

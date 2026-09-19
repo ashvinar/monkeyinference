@@ -16,7 +16,7 @@ Bonsai's geometry matches Qwen3.8-27B, but Splash only loads `splash-packed-q4` 
 - Greedy decode, leftover-greedy, prompt-lookup speculative decode, early-exit self-speculation, and Splash DFlash 2 leftover-verify
 - Coherence + token-identity gates wired into `monkeyinference bench`
 
-On this Air, greedy explain is **9.74–10.22 tok/s** (Low Power Mode off). Same-prompt PLD copy is **11.70 tok/s vs 8.19 leftover greedy** (10/10 accept, token-identical). Early-exit self-speculation plateaus at **1.07 accepts/pass**. Official Splash DFlash 2 `draft/` transfers at **3.00 accepts/pass** (K=7) and **7.32 tok/s** at default K=2 on the explain prompt, token-identical to greedy. That does not yet beat greedy in wall clock: target GDN cost scales with T (114 ms at T=1 vs 553 ms at T=8). Training a new draft is not required to clear 2× accepts/pass.
+On this Air, greedy explain is **10.22 tok/s** (Low Power Mode off; 9.74 is the same band). Same-prompt PLD copy is **11.70 tok/s vs 8.19 leftover greedy** (10/10 accept, token-identical). Early-exit plateaus at **1.07 accepts/pass**. Splash DFlash 2 transfers at **3.00 accepts/pass** (K=7) and **7.32 tok/s** at default K=2, token-identical to greedy, and does not beat greedy in wall clock. Prefill and verify share mlx_lm's sequential GDN kernel; leftover+K cannot inherit prefill's large-M qmm. Training a new draft is not required to clear 2× accepts/pass.
 
 ## Run
 

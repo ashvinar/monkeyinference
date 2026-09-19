@@ -83,8 +83,11 @@ def _default_num_draft(draft: str) -> int:
     if draft == "early":
         return 4
     if draft == "dflash":
-        # GDN verify cost scales with T (M=8 is 4.8× M=1). Typical transfer is
-        # leftover+2 accepted drafts, so K=2 (T=3, ~190 ms) is the tok/s point.
+        # Prefill and leftover+K verify share mlx_lm's sequential
+        # gated_delta_kernel (one launch, for t in T). There is no
+        # chunkwise-parallel GDN path, and leftover+K cannot inherit
+        # prefill's large-M qmm (forcing it regresses T=8 550→863 ms).
+        # Typical transfer is leftover+2, so K=2 (T=3, ~190 ms).
         return 2
     return 0
 
