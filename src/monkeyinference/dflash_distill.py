@@ -176,6 +176,8 @@ def collect_sequence(loaded, user: str, max_tokens: int) -> dict:
         leftover = mx.array([tok], dtype=mx.uint32)
         if tok in eos:
             break
+    if leftover.size:
+        mx.eval(body(leftover), [c.state for c in cache])
     wall = time.perf_counter() - t0
     all_ids = ids + generated
     ctx = aux.context()
