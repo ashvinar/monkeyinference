@@ -11,6 +11,7 @@ from monkeyinference.kernels import (
     stream_write,
     ternary_gemv,
     ternary_qmm,
+    ternary_qmm_m8,
     ternary_qmv_once,
 )
 from monkeyinference.roofline import pack_ternary
@@ -100,7 +101,7 @@ def test_ternary_qmm_batch_matches_gemv():
     mx.eval(got, *refs)
     for i in range(m):
         err = float(mx.max(mx.abs(got[i] - refs[i])).item())
-        assert err < 1e-4, (i, err)
+        assert err < 2e-2, (i, err)
 
 
 def test_ternary_qmv_once_matches_gemv():
@@ -113,6 +114,36 @@ def test_ternary_qmv_once_matches_gemv():
     for i in range(m):
         err = float(mx.max(mx.abs(got[i] - refs[i])).item())
         assert err < 1e-4, (i, err)
+
+
+def test_ternary_qmm_m8_matches_gemv():
+    n, k, m = 256, 512, 8
+    x, w, scales, biases = pack_ternary(n, k, seed=13)
+    xs = mx.stack([x * ((i + 1) * 0.3) for i in range(m)])
+    got = ternary_qmm_m8(xs, w, scales)
+    refs = [ternary_gemv(xs[i], w, scales) for i in range(m)]
+    mlx = mlx_affine_qmv(xs, w, scales, biases)
+    mx.eval(got, mlx, *refs)
+    for i in range(m):
+        err = float(mx.max(mx.abs(got[i] - refs[i])).item())
+        assert err < 2e-2, (i, err)
+    mlx_err = float(mx.max(mx.abs(got.astype(mx.float32) - mlx.astype(mx.float32))).item())
+    assert mlx_err < 0.50, mlx_err
+
+
+def test_ternary_qmm_m8_pads_short_m():
+    n, k, m = 256, 512, 3
+    x, w, scales, biases = pack_ternary(n, k, seed=14)
+    xs = mx.stack([x * ((i + 1) * 0.25) for i in range(m)])
+    got = ternary_qmm_m8(xs, w, scales)
+    via = ternary_qmm(xs, w, scales)
+    refs = [ternary_gemv(xs[i], w, scales) for i in range(m)]
+    mx.eval(got, via, *refs)
+    for i in range(m):
+        err = float(mx.max(mx.abs(got[i] - refs[i])).item())
+        assert err < 2e-2, (i, err)
+        err2 = float(mx.max(mx.abs(got[i] - via[i])).item())
+        assert err2 < 1e-4, (i, err2)
 
 
 def test_mlx_affine_flattens_3d_like_2d():

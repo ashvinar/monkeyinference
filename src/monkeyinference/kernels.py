@@ -1,4 +1,4 @@
-"""Metal kernels for STREAM bandwidth and ternary affine-2bit GEMV.
+"""Metal kernels for STREAM bandwidth and ternary affine-2bit matmul.
 
 Weight layout matches MLX / Prism affine 2-bit g128:
   w:      uint32[N, K/16]   16 codes per word, 2 bits each, K-contiguous
@@ -6,7 +6,9 @@ Weight layout matches MLX / Prism affine 2-bit g128:
   codes {0,1,2} decode to {-s, 0, +s} via (code - 1) * scale
   Prism stores bias = -scale; this kernel never loads bias.
 
-Decode (seq=1) is a GEMV. Prefill keeps mx.quantized_matmul.
+Decode (seq=1) is a GEMV (`ternary_qmv`). Spec verify is an 8-row MMA
+(`ternary_qmm_m8`): 256-thread TGs, dequant into threadgroup memory, then
+MPP `matmul2d`. Prefill keeps mx.quantized_matmul.
 """
 
 from __future__ import annotations
@@ -15,10 +17,13 @@ import mlx.core as mx
 
 GROUP = 128
 PACK = 16  # 2-bit codes per uint32
-# Spec leftover+draft is typically M=2–9. MLX qmv re-reads weights once per
-# row until M≥~12. VERIFY_ONCE_MAX is the largest M our weight-once qdot
-# kernel covers; prefill (M=512) stays on mx.quantized_matmul.
+# Spec leftover+draft is leftover+7 = 8 rows. VERIFY_ONCE_MAX still covers
+# the old qmv_once path for 9..16; M=2..8 goes through ternary_qmm_m8.
 VERIFY_ONCE_MAX = 16
+M8 = 8
+TILE_N = 128
+K_TILE = 64  # MMA K; two tiles share one g128 scale
+THREADS_M8 = 256
 
 _STREAM_COPY_SRC = r"""
     uint i = thread_position_in_grid.x;
@@ -261,6 +266,91 @@ _TERNARY_QMV_ONCE_SRC = r"""
     }
 """
 
+# Always-8-row decode MMA. Splash's q4_mpp_tile is matmul2d(8, TileN, 64)
+# with 256 threads / 8 simdgroups. There is no uint2b device tensor we can
+# feed through mlx.fast.metal_kernel (inputs are const device), so: load the
+# 2-bit tile, dequant (code-1)*scale into threadgroup half, then MPP matmul2d
+# on the TG tiles. Greedy T=1 stays on qmv_fast; this kernel is verify.
+_TERNARY_QMM_M8_HEADER = r"""
+#include <metal_stdlib>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace metal;
+using namespace mpp::tensor_ops;
+"""
+
+_TERNARY_QMM_M8_SRC = r"""
+    const uint lid = thread_index_in_threadgroup;
+    const uint tile = threadgroup_position_in_grid.x;
+    const uint n0 = tile * 128u;
+    const uint words_per_row = K / 16u;
+    const uint groups_per_row = K / 128u;
+
+    threadgroup half Atg[8 * 64];
+    threadgroup half Btg[128 * 64];
+
+    auto a = tensor(Atg, dextents<int, 2>{64, 8}, array<int, 2>{1, 64});
+    auto b = tensor(Btg, dextents<int, 2>{64, 128}, array<int, 2>{1, 64});
+    constexpr auto descriptor =
+        matmul2d_descriptor(8, 128, 64, false, true, false);
+    matmul2d<descriptor, execution_simdgroups<8>> operation;
+    auto a0 = a.slice<64, 8>(0, 0);
+    auto b0 = b.slice<64, 128>(0, 0);
+    auto accumulated = operation.template get_destination_cooperative_tensor<
+        decltype(a0), decltype(b0), float>();
+    for (ushort i = 0; i < accumulated.get_capacity(); ++i) {
+        accumulated[i] = 0.0f;
+    }
+
+    for (uint kbase = 0; kbase < K; kbase += 64u) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = lid; i < 512u; i += 256u) {
+            const uint m = i / 64u;
+            const uint kk = i % 64u;
+            Atg[i] = half(x[m * K + kbase + kk]);
+        }
+        const uint kword0 = kbase / 16u;
+        const uint g128 = kbase / 128u;
+        for (uint i = lid; i < 512u; i += 256u) {
+            const uint row_in_tile = i / 4u;
+            const uint word_in_k = i % 4u;
+            const uint row = n0 + row_in_tile;
+            uint word = 0u;
+            float s = 0.0f;
+            if (row < N) {
+                word = w[row * words_per_row + kword0 + word_in_k];
+                s = float(scales[row * groups_per_row + g128]);
+            }
+            const uint k_local = word_in_k * 16u;
+            #pragma unroll
+            for (uint lane16 = 0; lane16 < 16u; lane16++) {
+                const uint code = (word >> (2u * lane16)) & 3u;
+                Btg[row_in_tile * 64u + k_local + lane16] =
+                    half((float(code) - 1.0f) * s);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto partial = operation.template get_destination_cooperative_tensor<
+            decltype(a0), decltype(b0), float>();
+        operation.run(a0, b0, partial);
+        for (ushort i = 0; i < accumulated.get_capacity(); ++i) {
+            accumulated[i] += partial[i];
+        }
+    }
+
+    for (ushort i = 0; i < accumulated.get_capacity(); ++i) {
+        if (!accumulated.is_valid_element(i)) {
+            continue;
+        }
+        auto idx = accumulated.get_multidimensional_index(i);
+        const uint col = uint(idx[0]);
+        const uint row = uint(idx[1]);
+        const uint n = n0 + col;
+        if (row < 8u && n < N) {
+            y[row * N + n] = T(accumulated[i]);
+        }
+    }
+"""
+
 # Prefill path: each threadgroup does ROWS output rows for one token in the batch.
 # x is [M, K], y is [M, N]. tid.y selects the token.
 _TERNARY_QMM_SRC = r"""
@@ -318,6 +408,7 @@ _stream_write_kernel = None
 _qmv_cache: dict[tuple[int, int, int, type], object] = {}
 _qmv_once_cache: dict[tuple[int, int, int, type], object] = {}
 _qmm_cache: dict[tuple[int, int, int, type], object] = {}
+_qmm_m8_cache: dict[tuple[int, int, type], object] = {}
 
 ROWS_DEFAULT = 8
 
@@ -463,6 +554,64 @@ def ternary_qmv_once(
     return mx.reshape(y, orig[:-1] + (n,))
 
 
+def _qmm_m8_kernel(n: int, k: int, dtype):
+    key = (n, k, dtype)
+    kernel = _qmm_m8_cache.get(key)
+    if kernel is None:
+        kernel = mx.fast.metal_kernel(
+            name="monkey_ternary_qmm_m8",
+            input_names=["x", "w", "scales"],
+            output_names=["y"],
+            header=_TERNARY_QMM_M8_HEADER,
+            source=_TERNARY_QMM_M8_SRC,
+        )
+        _qmm_m8_cache[key] = kernel
+    return kernel
+
+
+def ternary_qmm_m8(
+    x: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+) -> mx.array:
+    """y = x @ ternary_W.T for 1..8 rows via a fixed 8-row MMA.
+
+    Pads M<8 with zeros. Always launches 256-thread TGs over N/128 tiles,
+    dequantizes each K=64 group into threadgroup memory, then MPP matmul2d.
+    """
+    orig = x.shape
+    x2 = mx.contiguous(
+        mx.reshape(x, (-1, orig[-1])) if x.ndim != 1 else mx.reshape(x, (1, -1))
+    )
+    m, k = int(x2.shape[0]), int(x2.shape[1])
+    n = int(weight.shape[0])
+    if m < 1 or m > M8:
+        raise ValueError(f"ternary_qmm_m8 supports 1..{M8} rows, got {m}")
+    if k % GROUP:
+        raise ValueError(f"K={k} is not a multiple of group size {GROUP}")
+    if k % K_TILE:
+        raise ValueError(f"K={k} is not a multiple of MMA K-tile {K_TILE}")
+    if weight.shape[1] * PACK != k:
+        raise ValueError(f"weight width {weight.shape[1]} does not pack K={k}")
+    if m < M8:
+        x2 = mx.contiguous(
+            mx.concatenate([x2, mx.zeros((M8 - m, k), dtype=x.dtype)], axis=0)
+        )
+    n_tg = (n + TILE_N - 1) // TILE_N
+    y = _qmm_m8_kernel(n, k, x.dtype)(
+        inputs=[x2, weight, scales],
+        template=[("T", x.dtype), ("N", n), ("K", k)],
+        grid=(n_tg * THREADS_M8, 1, 1),
+        threadgroup=(THREADS_M8, 1, 1),
+        output_shapes=[(M8, n)],
+        output_dtypes=[x.dtype],
+    )[0]
+    y = y[:m]
+    if x.ndim == 1:
+        return mx.reshape(y, (n,))
+    return mx.reshape(y, orig[:-1] + (n,))
+
+
 def _qmm_kernel(n: int, k: int, rows: int, dtype):
     key = (n, k, rows, dtype)
     kernel = _qmm_cache.get(key)
@@ -499,7 +648,8 @@ def ternary_qmm(
 ) -> mx.array:
     """y = x @ ternary_W.T  for x [M, K].
 
-    Decode (M=1) and small-M verify use the qdot qmv_fast clone (64-thread TGs).
+    Decode (M=1) uses the qdot qmv_fast clone (64-thread TGs).
+    Verify (M=2..8) uses the 8-row MMA. M=9..16 stays on weight-once qdot.
     Larger prefill M still uses the token-parallel qmm kernel.
     """
     orig = x.shape
@@ -510,9 +660,16 @@ def ternary_qmm(
         raise ValueError(f"K={k} is not a multiple of group size {GROUP}")
     if weight.shape[1] * PACK != k:
         raise ValueError(f"weight width {weight.shape[1]} does not pack K={k}")
-    # Weight-once qdot: one weight stream, M tokens in the inner loop.
-    if 1 < m <= VERIFY_ONCE_MAX:
-        return ternary_qmv_once(x2, weight, scales)
+    if 1 < m <= M8:
+        y = ternary_qmm_m8(x2, weight, scales)
+        if x.ndim == 1:
+            return mx.reshape(y, (n,))
+        return mx.reshape(y, orig[:-1] + (n,))
+    if M8 < m <= VERIFY_ONCE_MAX:
+        y = ternary_qmv_once(x2, weight, scales)
+        if x.ndim == 1:
+            return mx.reshape(y, (n,))
+        return mx.reshape(y, orig[:-1] + (n,))
     if m == 1:
         n_tg = (n + 7) // 8
         y = _qmv_kernel(n, k, 8, x.dtype)(

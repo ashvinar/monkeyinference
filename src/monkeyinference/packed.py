@@ -6,7 +6,14 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from monkeyinference.hadamard import fwht
-from monkeyinference.kernels import mlx_affine_qmv, ternary_qmm, ternary_qmv_once, VERIFY_ONCE_MAX
+from monkeyinference.kernels import (
+    M8,
+    VERIFY_ONCE_MAX,
+    mlx_affine_qmv,
+    ternary_qmm,
+    ternary_qmm_m8,
+    ternary_qmv_once,
+)
 from monkeyinference import parity as parity_mod
 
 
@@ -14,8 +21,8 @@ class PackedLinear(nn.Module):
     """Ternary affine-2bit linear with optional input Hadamard.
 
     Decode (M=1) may use the custom qdot GEMV (`use_custom=True`).
-    Prefill and speculative verify (M>1) always use MLX quantized matmul
-    so one weight stream covers every draft token.
+    Speculative verify (M=2..8) uses the 8-row MMA. Prefill (M>16) uses
+    MLX quantized matmul.
     """
 
     def __init__(
@@ -45,11 +52,26 @@ class PackedLinear(nn.Module):
             # without recomputing H(x) once per 8 output rows.
             x = fwht(x, self.signs, inverse=False)
         rows = int(x.size // x.shape[-1]) if x.size else 0
-        # M=1 decode: MLX qmv (or custom qdot if requested).
-        # 2..16: weight-once qdot so speculative verify streams W once.
+        # M=1 decode: custom qdot GEMV.
+        # 2..8: 8-row MMA (pad if needed). 9..16: weight-once qdot.
         # Prefill M>16: MLX qmm.
         if self.use_custom and rows <= 1:
             y = ternary_qmm(x, self.weight, self.scales).astype(self.dtype)
+            if parity_mod.PARITY_REMAINING > 0:
+                ref = mlx_affine_qmv(x, self.weight, self.scales, self.biases).astype(
+                    mx.float32
+                )
+                diff = y.astype(mx.float32) - ref
+                mx.eval(diff)
+                absd = mx.abs(diff)
+                parity_mod.record_parity(
+                    float(mx.max(absd).item()),
+                    float(mx.sqrt(mx.mean(diff * diff)).item()),
+                    tuple(int(s) for s in y.shape),
+                )
+            return y
+        if self.use_custom and 1 < rows <= M8:
+            y = ternary_qmm_m8(x, self.weight, self.scales).astype(self.dtype)
             if parity_mod.PARITY_REMAINING > 0:
                 ref = mlx_affine_qmv(x, self.weight, self.scales, self.biases).astype(
                     mx.float32
