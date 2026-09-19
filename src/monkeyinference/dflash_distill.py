@@ -23,6 +23,8 @@ from monkeyinference.dflash import (
     DFlashDrafter,
     MASK_TOKEN_ID,
     PROPOSAL_TOKENS,
+    load_drafter,
+    reset_drafter,
 )
 from monkeyinference.dflash_lora import save_adapters
 from monkeyinference.generate import generate
@@ -458,6 +460,31 @@ def train(
     return log
 
 
+def _reject_hist(prefix) -> dict:
+    hist: dict[int, int] = {}
+    for n in prefix:
+        hist[int(n)] = hist.get(int(n), 0) + 1
+    return hist
+
+
+def _dflash_row(run) -> dict:
+    return {
+        "tps": run.generation_tps,
+        "accepts_per_pass": run.accepts_per_pass,
+        "accept_prefix": list(run.accept_prefix),
+        "reject_hist": _reject_hist(run.accept_prefix),
+        "text": run.text,
+        "verify_s": run.verify_s,
+        "draft_s": run.draft_s,
+        "replay_s": run.replay_s,
+        "peak_memory_gb": run.peak_memory_gb,
+        "proposed_draft": run.proposed_draft,
+        "accepted_draft": run.accepted_draft,
+        "verify_passes": run.verify_passes,
+        "paper_k7": predicted_k7(run.accepts_per_pass),
+    }
+
+
 def evaluate_explain(loaded, *, num_draft: int = 7) -> dict:
     leftover = generate(
         loaded, EXPLAIN_PROMPT, max_tokens=48, speculative=True, draft="none"
@@ -472,9 +499,7 @@ def evaluate_explain(loaded, *, num_draft: int = 7) -> dict:
     )
     france = generate(loaded, FRANCE_PROMPT, max_tokens=8, speculative=False)
     identity = list(spec.tokens) == list(leftover.tokens)
-    hist = {}
-    for n in spec.accept_prefix:
-        hist[int(n)] = hist.get(int(n), 0) + 1
+    hist = _reject_hist(spec.accept_prefix)
     return {
         "leftover_tps": leftover.generation_tps,
         "dflash_tps": spec.generation_tps,
@@ -492,3 +517,101 @@ def evaluate_explain(loaded, *, num_draft: int = 7) -> dict:
         "accepted_draft": spec.accepted_draft,
         "verify_passes": spec.verify_passes,
     }
+
+
+def evaluate_compare(loaded, adapter_path: Path | None, *, num_draft: int = 7) -> dict:
+    """Greedy first, then leftover, stock DFlash, optional LoRA adapter.
+
+    One 27B load. Identity is leftover-greedy. Tok/s vs 10.22 is greedy
+    in this same process so thermal/LPM is shared across rows.
+    """
+    print("  greedy", flush=True)
+    greedy = generate(loaded, EXPLAIN_PROMPT, max_tokens=48, speculative=False)
+    print(f"    {greedy.generation_tps:.2f} tok/s", flush=True)
+    print("  leftover", flush=True)
+    leftover = generate(
+        loaded, EXPLAIN_PROMPT, max_tokens=48, speculative=True, draft="none"
+    )
+    print(f"    {leftover.generation_tps:.2f} tok/s", flush=True)
+    print("  france", flush=True)
+    france = generate(loaded, FRANCE_PROMPT, max_tokens=8, speculative=False)
+    print(f"    {france.text!r}", flush=True)
+
+    print("  stock DFlash K=7", flush=True)
+    reset_drafter()
+    load_drafter(adapter_path=False)
+    stock = generate(
+        loaded,
+        EXPLAIN_PROMPT,
+        max_tokens=48,
+        speculative=True,
+        draft="dflash",
+        num_draft=num_draft,
+    )
+    print(
+        f"    {stock.generation_tps:.2f} tok/s accepts/pass={stock.accepts_per_pass:.2f}",
+        flush=True,
+    )
+
+    l_tok = list(leftover.tokens)
+    g_tok = list(greedy.tokens)
+    s_tok = list(stock.tokens)
+    ev = {
+        "greedy_tps": greedy.generation_tps,
+        "leftover_tps": leftover.generation_tps,
+        "france": france.text,
+        "greedy_identity_vs_leftover": g_tok == l_tok,
+        "stock": _dflash_row(stock),
+        "stock_identity_vs_leftover": s_tok == l_tok,
+        "adapter": None,
+        "adapter_identity_vs_leftover": None,
+        "adapter_identity_vs_stock": None,
+        "need_accepts_vs_10_22": MIN_ACCEPTS_TO_BEAT_GREEDY,
+        "baseline_greedy_tps": GREEDY_TPS,
+    }
+
+    path = Path(adapter_path) if adapter_path else None
+    if path is not None and path.is_file():
+        print(f"  LoRA adapter {path}", flush=True)
+        reset_drafter()
+        load_drafter(adapter_path=path)
+        ft = generate(
+            loaded,
+            EXPLAIN_PROMPT,
+            max_tokens=48,
+            speculative=True,
+            draft="dflash",
+            num_draft=num_draft,
+        )
+        print(
+            f"    {ft.generation_tps:.2f} tok/s accepts/pass={ft.accepts_per_pass:.2f}",
+            flush=True,
+        )
+        f_tok = list(ft.tokens)
+        ev["adapter"] = _dflash_row(ft)
+        ev["adapter_identity_vs_leftover"] = f_tok == l_tok
+        ev["adapter_identity_vs_stock"] = f_tok == s_tok
+        ev["dflash_tps"] = ft.generation_tps
+        ev["accepts_per_pass"] = ft.accepts_per_pass
+        ev["identity_vs_leftover"] = f_tok == l_tok
+        ev["text"] = ft.text
+        ev["accept_prefix"] = list(ft.accept_prefix)
+        ev["reject_hist"] = _reject_hist(ft.accept_prefix)
+        ev["paper_k7"] = predicted_k7(ft.accepts_per_pass)
+        ev["beats_greedy"] = bool(
+            f_tok == l_tok and ft.generation_tps > greedy.generation_tps
+        )
+        ev["beats_10_22"] = bool(f_tok == l_tok and ft.generation_tps > GREEDY_TPS)
+    else:
+        ev["dflash_tps"] = stock.generation_tps
+        ev["accepts_per_pass"] = stock.accepts_per_pass
+        ev["identity_vs_leftover"] = s_tok == l_tok
+        ev["text"] = stock.text
+        ev["accept_prefix"] = list(stock.accept_prefix)
+        ev["reject_hist"] = _reject_hist(stock.accept_prefix)
+        ev["paper_k7"] = predicted_k7(stock.accepts_per_pass)
+        ev["beats_greedy"] = bool(
+            s_tok == l_tok and stock.generation_tps > greedy.generation_tps
+        )
+        ev["beats_10_22"] = bool(s_tok == l_tok and stock.generation_tps > GREEDY_TPS)
+    return ev

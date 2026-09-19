@@ -26,14 +26,12 @@ from monkeyinference.dflash_distill import (
     DEFAULT_DIR,
     DISTILL_PROMPTS,
     FrozenHead,
-    MIN_ACCEPTS_TO_BEAT_GREEDY,
     STEP_TIME_ABORT_S,
     collect_sequence,
-    evaluate_explain,
+    evaluate_compare,
     infer_resume_step,
     iter_windows,
     load_dataset,
-    predicted_k7,
     save_dataset,
     train,
 )
@@ -200,33 +198,22 @@ def cmd_train(args) -> dict:
 
 
 def cmd_eval(args) -> dict:
-    print("=== eval explain leftover-identity + DFlash K=7 ===", flush=True)
+    print("=== eval explain leftover-identity + DFlash K=7 (stock vs LoRA) ===", flush=True)
     reset_drafter()
     loaded = load_text_model(mix_five_trit=False)
     adapters = Path(args.dir) / "adapters.safetensors"
-    if adapters.is_file():
-        load_drafter(adapter_path=adapters)
-    else:
-        load_drafter(adapter_path=False)
-        print("  no adapters file; evaluating the stock Q4 draft", flush=True)
-    ev = evaluate_explain(loaded, num_draft=7)
-    greedy = None
-    from monkeyinference.generate import generate
-    from monkeyinference.bench import EXPLAIN_PROMPT
-
-    greedy = generate(loaded, EXPLAIN_PROMPT, max_tokens=48, speculative=False)
-    ev["greedy_tps"] = greedy.generation_tps
-    ev["beats_greedy"] = bool(
-        ev["identity_vs_leftover"] and ev["dflash_tps"] > greedy.generation_tps
+    ev = evaluate_compare(
+        loaded, adapters if adapters.is_file() else None, num_draft=7
     )
-    ev["paper_k7"] = predicted_k7(ev["accepts_per_pass"])
-    ev["need_accepts_vs_10_22"] = MIN_ACCEPTS_TO_BEAT_GREEDY
     (Path(args.dir) / "eval.json").write_text(json.dumps(ev, indent=2, default=str))
+    (Path(args.dir) / "compare.json").write_text(json.dumps(ev, indent=2, default=str))
     paper = ev["paper_k7"]
+    stock = ev.get("stock") or {}
     print(
-        f"  greedy {greedy.generation_tps:.2f} tok/s  dflash {ev['dflash_tps']:.2f} "
-        f"accepts/pass={ev['accepts_per_pass']:.2f} identity={ev['identity_vs_leftover']} "
-        f"france={ev['france']!r}",
+        f"  greedy {ev['greedy_tps']:.2f} tok/s  leftover {ev['leftover_tps']:.2f}  "
+        f"stock accepts={stock.get('accepts_per_pass')}  "
+        f"adapter accepts={ev.get('accepts_per_pass')}  "
+        f"identity={ev['identity_vs_leftover']} france={ev['france']!r}",
         flush=True,
     )
     print(

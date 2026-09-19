@@ -343,21 +343,16 @@ def load_drafter(
     """Load once. Draft Q4 unpack is ~1.3 GB and should not hit the generate timer twice.
 
     adapter_path:
-      None  — load ~/.monkey/dflash-ft/adapters.safetensors if it exists
-      False — never load adapters (training)
-      Path  — load that file
+      None / False — stock Q4 (production default). The 2026-09-19 LoRA
+        run *lowered* held-out accepts (2.09 vs 3.00), so adapters are
+        opt-in, not auto-loaded from ~/.monkey/dflash-ft/.
+      Path — load that LoRA file
     """
     global _DRAFTER
     if _DRAFTER is None:
         _DRAFTER = DFlashDrafter(load_dflash_draft(directory))
         path = None
-        if adapter_path is False:
-            path = None
-        elif adapter_path is None:
-            from monkeyinference.dflash_lora import DEFAULT_ADAPTERS
-
-            path = DEFAULT_ADAPTERS if DEFAULT_ADAPTERS.is_file() else None
-        else:
+        if adapter_path not in (None, False):
             path = Path(adapter_path)
         if path is not None:
             from monkeyinference.dflash_lora import load_adapters, wrap_drafter
