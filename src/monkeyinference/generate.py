@@ -6,7 +6,7 @@ import time
 from dataclasses import asdict, dataclass, field
 
 import mlx.core as mx
-from mlx_lm.generate import stream_generate
+from mlx_lm.generate import generation_stream, stream_generate, wired_limit
 from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.sample_utils import make_sampler
 
@@ -121,17 +121,18 @@ def generate(
 
     t0 = time.perf_counter()
     if speculative:
-        result = _speculative(
-            model,
-            tokenizer,
-            prompt,
-            max_tokens=max_tokens,
-            draft_kind=draft,
-            num_draft=num_draft,
-            ngram=ngram,
-            early_layers=early_layers,
-            prefill_step=prefill_step,
-        )
+        with wired_limit(model, [generation_stream]):
+            result = _speculative(
+                model,
+                tokenizer,
+                prompt,
+                max_tokens=max_tokens,
+                draft_kind=draft,
+                num_draft=num_draft,
+                ngram=ngram,
+                early_layers=early_layers,
+                prefill_step=prefill_step,
+            )
     else:
         if temperature != 0.0:
             raise ValueError("only greedy (temperature=0) is wired; sampling is a later milestone")
@@ -212,14 +213,32 @@ def _speculative(
     elif draft_kind not in ("pld", "none"):
         raise ValueError(f"unknown draft {draft_kind!r}")
 
-    def target_forward(ids, cache, capture: bool = True):
-        out = model(ids, cache=cache)
+    def target_body(ids, cache, capture: bool = True):
+        """Transformer only. Replay does not need the 0.32 GB lm_head stream."""
+        hidden = model.model(ids, cache=cache)
         if capture and aux is not None:
             aux.record_last_forward()
-        return out
+        return hidden
+
+    def target_logits(ids, cache, capture: bool = True):
+        hidden = target_body(ids, cache, capture=capture)
+        return model.lm_head(hidden)
+
+    committed_aux = 0
+
+    def commit_new_aux():
+        nonlocal committed_aux
+        if dflash is None or aux is None:
+            return
+        rows = aux.uncommitted(committed_aux)
+        if rows is None:
+            return
+        dflash.commit_new(rows)
+        committed_aux = len(aux)
 
     t_pre = time.perf_counter()
-    y = _prefill(target_forward, tokens, target_cache, prefill_step)
+    y = _prefill(target_body, tokens, target_cache, prefill_step)
+    commit_new_aux()
     if early is not None:
         _prefill(lambda ids, cache: early.logits(ids, cache), tokens, draft_cache, prefill_step)
     mx.eval(y)
@@ -254,13 +273,11 @@ def _speculative(
             draft_s += time.perf_counter() - t_d
         elif k > 0 and dflash is not None:
             t_d = time.perf_counter()
-            ctx = aux.context()
             leftover = int(y.reshape(-1)[-1].item())
-            if ctx is None:
+            if aux is None or len(aux) == 0:
                 draft_ids = []
             else:
                 draft_ids = dflash.propose(
-                    aux=ctx,
                     leftover_token=leftover,
                     embed=model.model.embed_tokens,
                     lm_head=model.lm_head,
@@ -272,13 +289,16 @@ def _speculative(
         if not draft_ids:
             leftover = y
             t_v = time.perf_counter()
-            logits = target_forward(leftover[None], target_cache, capture=True)
-            mx.eval(logits)
+            logits = target_logits(leftover[None], target_cache, capture=True)
+            tok_arr = mx.argmax(logits[:, -1, :], axis=-1)
+            mx.eval(tok_arr, [c.state for c in target_cache])
             verify_s += time.perf_counter() - t_v
-            tok = int(mx.argmax(logits[:, -1, :]).item())
+            tok = int(tok_arr.item())
             verify_passes += 1
             generated.append(tok)
             context_ids.append(tok)
+            if aux is not None:
+                commit_new_aux()
             if early is not None:
                 # Target consumed leftover; draft is still sitting on it.
                 mx.eval(early.logits(leftover, draft_cache))
@@ -293,11 +313,12 @@ def _speculative(
         target_pin = pin_cache(target_cache)
         y_run = mx.concatenate([y, mx.array(draft_ids, dtype=mx.uint32)])
         t_v = time.perf_counter()
-        logits = target_forward(y_run[None], target_cache, capture=True)
-        mx.eval(logits)
+        logits = target_logits(y_run[None], target_cache, capture=True)
+        pred_arr = mx.argmax(logits, axis=-1).reshape(-1)
+        mx.eval(pred_arr, [c.state for c in target_cache])
         verify_s += time.perf_counter() - t_v
         verify_passes += 1
-        pred = [int(v) for v in mx.argmax(logits, axis=-1).reshape(-1).tolist()]
+        pred = [int(v) for v in pred_arr.tolist()]
         n_accept = 0
         for i, dtok in enumerate(draft_ids):
             if pred[i] != int(dtok):
@@ -308,8 +329,11 @@ def _speculative(
         if aux is not None:
             # leftover + accepted drafts become context; bonus is the next leftover.
             aux.keep_last_n(1 + n_accept)
+            commit_new_aux()
 
         if n_accept < len(draft_ids):
+            # GDN is recurrent: revert the CoW pin and replay leftover+accepted.
+            # Replay skips lm_head — those logits are already known.
             t_r = time.perf_counter()
             revert_cache(target_pin)
             replay = (
@@ -317,7 +341,10 @@ def _speculative(
                 if n_accept
                 else y
             )
-            mx.eval(target_forward(replay[None], target_cache, capture=False))
+            mx.eval(
+                target_body(replay[None], target_cache, capture=False),
+                [c.state for c in target_cache],
+            )
             replay_s += time.perf_counter() - t_r
 
         if early is not None and draft_pin is not None:
@@ -354,6 +381,8 @@ def _speculative(
     decode_s = time.perf_counter() - t_decode
     if aux is not None:
         aux.close()
+    if dflash is not None:
+        dflash.reset_cache()
     text = tokenizer.decode(generated, skip_special_tokens=True)
     n_gen = len(generated)
     return GenerateResult(

@@ -16,6 +16,7 @@ import mlx.nn as nn
 from mlx_lm.models.cache import KVCache
 from mlx_lm.models.rope_utils import initialize_rope
 
+from monkeyinference.spec import pin_cache, revert_cache
 from monkeyinference.splash_q4 import (
     BLOCK,
     CONV_GROUP,
@@ -131,6 +132,19 @@ class AuxCapture:
         if n < int(last.shape[0]):
             self.tokens[-1] = last[:n]
 
+    def __len__(self) -> int:
+        return sum(int(t.shape[0]) for t in self.tokens)
+
+    def uncommitted(self, committed: int) -> mx.array | None:
+        """Rows of `context()` not yet written into the draft KV cache."""
+        ctx = self.context()
+        if ctx is None:
+            return None
+        n = int(ctx.shape[0])
+        if committed >= n:
+            return None
+        return ctx[committed:]
+
 
 class DFlashDrafter:
     def __init__(self, weights: DraftWeights, *, rope_theta: float = 10_000_000.0):
@@ -148,13 +162,28 @@ class DFlashDrafter:
         )
         self.q_size = N_HEADS * HEAD_DIM
         self.kv_size = KV_HEADS * HEAD_DIM
+        self.ctx_cache: list = []
+        self.reset_cache()
 
     @property
     def bytes_on_disk(self) -> int:
         return self.w.bytes_on_disk
 
+    def reset_cache(self) -> None:
+        """Drop draft context KV. Call at the start of each generate."""
+        self.ctx_cache = [KVCache() for _ in range(LAYERS)]
+
+    def commit_new(self, aux: mx.array) -> None:
+        """Append newly accepted target hiddens onto the persistent draft KV."""
+        self.commit_context(aux, self.ctx_cache)
+
     def _q4(self, lin, x: mx.array) -> mx.array:
-        return lin(x.astype(mx.float16)).astype(mx.float32)
+        """fp16 Q4. Used for every projection that does not overflow fp16."""
+        return lin(x.astype(mx.float16))
+
+    def _q4_f32(self, lin, x: mx.array) -> mx.array:
+        """fp32 accum/output. o_proj / down / context_proj biases overflow fp16."""
+        return lin(x.astype(mx.float32))
 
     def _conv_pair(self, hidden: mx.array, dynamic: mx.array, base: mx.array):
         # dynamic: [T, 1280] = 2 sides × 2 taps × 320 groups
@@ -181,8 +210,8 @@ class DFlashDrafter:
         """Project captured target hiddens and write draft K/V (no query)."""
         if aux.ndim == 3:
             aux = aux.reshape(-1, TARGET_HIDDEN)
-        projected = self._q4(self.w.context_proj, aux)
-        hidden = rms_norm(projected, self.w.hidden_norm)
+        projected = self._q4_f32(self.w.context_proj, aux)
+        hidden = rms_norm(projected, self.w.hidden_norm).astype(mx.float16)
         t = int(hidden.shape[0])
         for layer, c in zip(self.w.layers, cache):
             qkv = self._q4(layer.qkv, hidden)
@@ -210,35 +239,41 @@ class DFlashDrafter:
         values = self._heads(v, self.n_kv).astype(mx.float16)
         keys, values = cache.update_and_fetch(keys, values)
         out = mx.fast.scaled_dot_product_attention(
-            queries.astype(mx.float32),
-            keys.astype(mx.float32),
-            values.astype(mx.float32),
-            scale=self.scale,
-            mask=None,
+            queries, keys, values, scale=self.scale, mask=None
         )
-        return self._q4(layer.o_proj, self._from_heads(out))
+        # o_proj biases ±6.5 overflow an fp16 matmul output (max ~7k).
+        return self._q4_f32(layer.o_proj, self._from_heads(out))
 
     def _mlp(self, hidden: mx.array, layer) -> mx.array:
-        gate = self._q4(layer.gate, hidden)
-        up = self._q4(layer.up, hidden)
-        return self._q4(layer.down, nn.silu(gate) * up)
+        gate = self._q4(layer.gate, hidden).astype(mx.float32)
+        up = self._q4(layer.up, hidden).astype(mx.float32)
+        # down biases ±9 overflow fp16 output the same way o_proj does.
+        return self._q4_f32(layer.down, nn.silu(gate) * up)
 
     def backbone(self, hidden: mx.array, cache: list) -> mx.array:
-        """hidden: [T, H] query rows. Mutates `cache`. Residual stream is float32."""
-        h = hidden.astype(mx.float32)
+        """hidden: [T, H] query rows. Residual is fp16; o_proj/down accumulate fp32."""
+        h = hidden.astype(mx.float16)
         for layer, c in zip(self.w.layers, cache):
             residual = h
             n = rms_norm(h, layer.input_norm)
             n, coeff = self._conv_pair(n, self._q4(layer.attn_dynamic, n), layer.attn_conv)
             a = self._attn(n, layer, c)
-            a = grouped_conv(a, coeff, layer.attn_conv[1].astype(a.dtype))
-            h = residual + a
+            a = grouped_conv(
+                a.astype(mx.float32),
+                coeff.astype(mx.float32),
+                layer.attn_conv[1].astype(mx.float32),
+            )
+            h = (residual.astype(mx.float32) + a).astype(mx.float16)
             residual = h
             n = rms_norm(h, layer.post_attn_norm)
             n, coeff = self._conv_pair(n, self._q4(layer.mlp_dynamic, n), layer.mlp_conv)
             m = self._mlp(n, layer)
-            m = grouped_conv(m, coeff, layer.mlp_conv[1].astype(m.dtype))
-            h = residual + m
+            m = grouped_conv(
+                m.astype(mx.float32),
+                coeff.astype(mx.float32),
+                layer.mlp_conv[1].astype(mx.float32),
+            )
+            h = (residual.astype(mx.float32) + m).astype(mx.float16)
         return rms_norm(h, self.w.final_norm)
 
     def select(self, logits: mx.array, selector_hidden: mx.array, anchor: int, k: int) -> list[int]:
@@ -248,21 +283,20 @@ class DFlashDrafter:
             return []
         slots = logits[1 : 1 + k]
         hidden = selector_hidden[1 : 1 + k]
+        top = mx.argsort(-slots, axis=-1)[:, :SELECTOR_TOP_K]
+        mx.eval(top)
         path: list[int] = []
         prev = int(anchor)
         for i in range(k):
-            row = slots[i]
-            top = mx.argsort(-row)[:SELECTOR_TOP_K]
-            mx.eval(top)
-            cand = [int(x) for x in top.tolist()]
-            unary = row[mx.array(cand, dtype=mx.uint32)]
-            succ = self.w.successor[mx.array(cand, dtype=mx.uint32)]
+            cand = top[i]
+            unary = slots[i][cand]
+            succ = self.w.successor[cand]
             pred = self.w.predecessor[prev]
-            h = hidden[i]
-            scores = unary.astype(mx.float32) + (pred * h).astype(mx.float32) @ succ.astype(mx.float32).T
-            mx.eval(scores)
+            scores = unary.astype(mx.float32) + (pred * hidden[i]).astype(mx.float32) @ succ.astype(
+                mx.float32
+            ).T
             idx = int(mx.argmax(scores).item())
-            tok = cand[idx]
+            tok = int(cand[idx].item())
             path.append(tok)
             prev = tok
         return path
@@ -270,25 +304,42 @@ class DFlashDrafter:
     def propose(
         self,
         *,
-        aux: mx.array,
         leftover_token: int,
         embed,
         lm_head,
         k: int = PROPOSAL_TOKENS,
     ) -> list[int]:
-        cache = [KVCache() for _ in range(LAYERS)]
-        self.commit_context(aux, cache)
-        ids = [int(leftover_token)] + [MASK_TOKEN_ID] * PROPOSAL_TOKENS
-        tokens = mx.array(ids, dtype=mx.uint32)
-        hidden = embed(tokens)
-        if hidden.ndim == 3:
-            hidden = hidden.reshape(hidden.shape[1], hidden.shape[2])
-        hidden = self.backbone(hidden, cache)
-        logits = lm_head(hidden.astype(mx.float16))
-        sel_h = self._q4(self.w.selector, hidden)
-        mx.eval(logits, sel_h)
-        return self.select(logits.reshape(int(logits.shape[-2]), int(logits.shape[-1])), sel_h, leftover_token, k)
+        """Query leftover+MASK against the persistent context KV. Does not rebuild context."""
+        cache = self.ctx_cache
+        pin = pin_cache(cache)
+        try:
+            ids = [int(leftover_token)] + [MASK_TOKEN_ID] * PROPOSAL_TOKENS
+            tokens = mx.array(ids, dtype=mx.uint32)
+            hidden = embed(tokens)
+            if hidden.ndim == 3:
+                hidden = hidden.reshape(hidden.shape[1], hidden.shape[2])
+            hidden = self.backbone(hidden, cache)
+            logits = lm_head(hidden.astype(mx.float16))
+            sel_h = self._q4(self.w.selector, hidden)
+            mx.eval(sel_h, logits)
+            return self.select(
+                logits.reshape(int(logits.shape[-2]), int(logits.shape[-1])),
+                sel_h,
+                leftover_token,
+                k,
+            )
+        finally:
+            revert_cache(pin)
+
+
+_DRAFTER: DFlashDrafter | None = None
 
 
 def load_drafter(directory: str | Path | None = None) -> DFlashDrafter:
-    return DFlashDrafter(load_dflash_draft(directory))
+    """Load once. Draft Q4 unpack is ~1.3 GB and should not hit the generate timer twice."""
+    global _DRAFTER
+    if _DRAFTER is None:
+        _DRAFTER = DFlashDrafter(load_dflash_draft(directory))
+    else:
+        _DRAFTER.reset_cache()
+    return _DRAFTER

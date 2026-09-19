@@ -266,8 +266,14 @@ def run_bench(
 
 
 def run_dflash_bench(pack: str | Path | None = None) -> dict:
-    """Explain-prompt accepts/pass for the Splash DFlash 2 draft vs leftover greedy."""
+    """Explain-prompt accepts/pass and wall tok/s vs leftover greedy and stream greedy."""
     loaded = load_text_model(pack, use_custom_kernels=True)
+    greedy = generate(
+        loaded,
+        EXPLAIN_PROMPT,
+        max_tokens=48,
+        speculative=False,
+    )
     leftover = generate(
         loaded,
         EXPLAIN_PROMPT,
@@ -276,6 +282,9 @@ def run_dflash_bench(pack: str | Path | None = None) -> dict:
         draft="none",
         parity_layers=0,
     )
+    from monkeyinference.dflash import load_drafter
+
+    load_drafter()
     dflash = generate(
         loaded,
         EXPLAIN_PROMPT,
@@ -284,7 +293,9 @@ def run_dflash_bench(pack: str | Path | None = None) -> dict:
         draft="dflash",
         parity_layers=0,
     )
-    identity = _tokens_match(leftover.tokens, dflash.tokens)
+    identity_left = _tokens_match(leftover.tokens, dflash.tokens)
+    identity_greedy = _tokens_match(greedy.tokens, dflash.tokens)
+    identity = identity_left and identity_greedy
     coh = _coherence("spec", dflash.text)
     from pathlib import Path as _P
 
@@ -296,6 +307,7 @@ def run_dflash_bench(pack: str | Path | None = None) -> dict:
         "draft_dir": str(draft_dir),
         "draft_bytes": on_disk,
         "draft_gb": on_disk / 1e9,
+        "greedy": _payload(greedy),
         "leftover": _payload(leftover),
         "dflash": _payload(dflash),
         "accepts_per_pass": dflash.accepts_per_pass,
@@ -304,9 +316,13 @@ def run_dflash_bench(pack: str | Path | None = None) -> dict:
         "verify_passes": dflash.verify_passes,
         "token_identity": identity,
         "identity_ok": identity,
+        "identity_vs_leftover": identity_left,
+        "identity_vs_greedy": identity_greedy,
         "coherence": coh,
         "beats_early_exit": dflash.accepts_per_pass > 1.2,
-        "usable": dflash.accepts_per_pass >= 2.0 and identity,
+        "beats_same_run_greedy": dflash.generation_tps > greedy.generation_tps,
+        "beats_974": dflash.generation_tps > 9.74,
+        "usable": dflash.accepts_per_pass >= 2.0 and identity and dflash.generation_tps > 9.74,
     }
     del loaded
     gc.collect()
