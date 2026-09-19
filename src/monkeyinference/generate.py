@@ -111,6 +111,8 @@ def generate(
 
     if parity_layers:
         reset_parity(parity_layers)
+    else:
+        reset_parity(0)
     reset = getattr(mx, "reset_peak_memory", None) or getattr(mx.metal, "reset_peak_memory", None)
     if callable(reset):
         reset()
