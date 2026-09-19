@@ -185,6 +185,32 @@ def test_five_trit_gemv_matches_qdot():
         assert err < 2e-2, (err, n, k)
 
 
+def test_linear_nk_and_mixed_gate():
+    from monkeyinference.packed import PackedLinear
+    from monkeyinference.trit import apply_mixed_five_trit, linear_nk
+
+    x, w, scales, biases = pack_ternary(128, 512, seed=41)
+    lin = PackedLinear(w, scales, biases, None, 0, use_custom=True)
+    assert linear_nk(lin) == (128, 512)
+    assert lin.trit_weight is None
+
+    class _M:
+        lm_head = lin
+        class model:
+            layers = []
+
+    report = apply_mixed_five_trit(_M, wins=frozenset({(128, 512)}))
+    assert report["n_enabled"] == 1
+    assert lin.trit_weight is not None
+    y = lin(x)
+    ref = ternary_gemv(x, w, scales)
+    mx.eval(y, ref)
+    err = float(mx.max(mx.abs(y.astype(mx.float32) - ref.astype(mx.float32))).item())
+    assert err < 2e-2, err
+    apply_mixed_five_trit(_M, wins=frozenset())
+    assert lin.trit_weight is None
+
+
 def test_prompt_lookup_drafter():
     d = PromptLookupDrafter(ngram=3, max_draft=4)
     tokens = [1, 2, 3, 4, 5, 1, 2, 3]

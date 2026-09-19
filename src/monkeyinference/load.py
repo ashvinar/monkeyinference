@@ -32,6 +32,7 @@ class LoadedModel:
     use_custom_kernels: bool
     language_bytes: int
     skipped_vision_bytes: int
+    mix_five_trit: dict | None = None
 
 
 def _metal_stats() -> dict:
@@ -48,6 +49,8 @@ def load_text_model(
     *,
     use_custom_kernels: bool = True,
     load_tokenizer: bool = True,
+    mix_five_trit: bool = True,
+    trit_wins: frozenset | None = None,
 ) -> LoadedModel:
     pack = Path(pack or DEFAULT_PACK)
     config = json.loads((pack / "config.json").read_text())
@@ -97,6 +100,12 @@ def load_text_model(
     model.eval()
     mx.eval(model.parameters())
 
+    mix_report = None
+    if use_custom_kernels and mix_five_trit:
+        from monkeyinference.trit import apply_mixed_five_trit
+
+        mix_report = apply_mixed_five_trit(model, wins=trit_wins)
+
     tokenizer = None
     if load_tokenizer:
         tokenizer = _load_tokenizer(pack)
@@ -110,6 +119,7 @@ def load_text_model(
         use_custom_kernels=use_custom_kernels,
         language_bytes=language_bytes,
         skipped_vision_bytes=skipped,
+        mix_five_trit=mix_report,
     )
 
 

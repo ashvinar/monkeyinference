@@ -79,3 +79,155 @@ def trit_weight_bytes(n: int, k: int) -> int:
 def five_trit_qmm(x: mx.array, trit_w: mx.array, scales: mx.array) -> mx.array:
     """y = x @ five-trit_W.T. Greedy M=1 path; same (code-1)*s contract as qdot."""
     return ternary_trit_qmm(x, trit_w, scales)
+
+
+def linear_nk(linear) -> tuple[int, int]:
+    """PackedLinear affine-2bit weight is uint32[N, K/16]."""
+    n = int(linear.weight.shape[0])
+    k = int(linear.weight.shape[1]) * PACK
+    return n, k
+
+
+def iter_packed_linears(model):
+    """Yield (path, PackedLinear) for Bonsai text modules."""
+    from monkeyinference.packed import PackedLinear
+
+    lm = getattr(model, "lm_head", None)
+    if isinstance(lm, PackedLinear):
+        yield "lm_head", lm
+    inner = getattr(model, "model", model)
+    layers = getattr(inner, "layers", None)
+    if layers is None:
+        return
+    names = (
+        "mlp.gate_proj",
+        "mlp.up_proj",
+        "mlp.down_proj",
+        "linear_attn.in_proj_qkv",
+        "linear_attn.in_proj_z",
+        "linear_attn.out_proj",
+        "self_attn.q_proj",
+        "self_attn.k_proj",
+        "self_attn.v_proj",
+        "self_attn.o_proj",
+    )
+    for i, layer in enumerate(layers):
+        for name in names:
+            obj = layer
+            ok = True
+            for part in name.split("."):
+                if not hasattr(obj, part):
+                    ok = False
+                    break
+                obj = getattr(obj, part)
+            if ok and isinstance(obj, PackedLinear):
+                yield f"layers.{i}.{name}", obj
+
+
+# Shapes where five-trit GEMV beat 2-bit qdot by ≥5% on real Bonsai
+# weights (interleaved). 2.02× on mlp_up is a LOSS (trit slower). Updated
+# after calibrate_five_trit_wins(); empty means all-2-bit.
+TRIT_WIN_NK: frozenset[tuple[int, int]] = frozenset()
+TRIT_WIN_MARGIN = 0.95  # trit must be < 95% of qdot wall
+LM_HEAD_N_SKIP = 100_000  # do not pack 248320-row lm_head during calibrate
+
+
+def calibrate_five_trit_wins(
+    model,
+    *,
+    warmup: int = 4,
+    iters: int = 12,
+    margin: float = TRIT_WIN_MARGIN,
+) -> dict:
+    """Interleaved qdot vs five-trit on one real tensor per unique (N, K)."""
+    import time
+
+    from monkeyinference.kernels import ternary_qmm, ternary_trit_qmm
+
+    rows = []
+    seen: set[tuple[int, int]] = set()
+    for path, lin in iter_packed_linears(model):
+        nk = linear_nk(lin)
+        if nk in seen:
+            continue
+        seen.add(nk)
+        n, k = nk
+        if n >= LM_HEAD_N_SKIP:
+            rows.append(
+                {
+                    "path": path,
+                    "n": n,
+                    "k": k,
+                    "skip": "lm_head_too_wide",
+                    "win": False,
+                }
+            )
+            continue
+        x = mx.random.normal((k,)).astype(mx.float16)
+        trit = pack_five_trit(lin.weight)
+        mx.eval(x, trit, lin.weight, lin.scales)
+
+        def qdot():
+            return ternary_qmm(x, lin.weight, lin.scales)
+
+        def trit_fn():
+            return ternary_trit_qmm(x, trit, lin.scales)
+
+        for _ in range(warmup):
+            mx.eval(qdot())
+            mx.eval(trit_fn())
+        q_s, t_s = [], []
+        for _ in range(iters):
+            mx.synchronize()
+            t0 = time.perf_counter()
+            mx.eval(qdot())
+            mx.synchronize()
+            q_s.append(time.perf_counter() - t0)
+            mx.synchronize()
+            t0 = time.perf_counter()
+            mx.eval(trit_fn())
+            mx.synchronize()
+            t_s.append(time.perf_counter() - t0)
+        q_us = 1e6 * sorted(q_s)[len(q_s) // 2]
+        t_us = 1e6 * sorted(t_s)[len(t_s) // 2]
+        ratio = t_us / q_us if q_us else None
+        win = bool(ratio is not None and ratio < margin)
+        rows.append(
+            {
+                "path": path,
+                "n": n,
+                "k": k,
+                "qdot_us": q_us,
+                "trit_us": t_us,
+                "trit_over_qdot": ratio,
+                "win": win,
+            }
+        )
+        del trit
+        mx.clear_cache()
+    wins = frozenset((int(r["n"]), int(r["k"])) for r in rows if r.get("win"))
+    return {"margin": margin, "wins": sorted(wins), "rows": rows}
+
+
+def apply_mixed_five_trit(model, wins: frozenset[tuple[int, int]] | None = None) -> dict:
+    """Enable five-trit GEMV only on shapes in `wins`. MMA stays 2-bit."""
+    if wins is None:
+        wins = TRIT_WIN_NK
+    enabled = []
+    skipped = []
+    for path, lin in iter_packed_linears(model):
+        nk = linear_nk(lin)
+        if nk in wins:
+            if lin.trit_weight is None:
+                lin.enable_five_trit()
+            enabled.append({"path": path, "n": nk[0], "k": nk[1]})
+        else:
+            lin.trit_weight = None
+            skipped.append({"path": path, "n": nk[0], "k": nk[1]})
+    return {
+        "n_enabled": len(enabled),
+        "n_skipped": len(skipped),
+        "wins": sorted(wins),
+        "enabled": enabled,
+        "skipped": skipped,
+    }

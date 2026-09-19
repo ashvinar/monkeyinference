@@ -42,6 +42,7 @@ class GenerateResult:
     draft_s: float = 0.0
     verify_s: float = 0.0
     replay_s: float = 0.0
+    accept_prefix: list[int] = field(default_factory=list)
 
     @property
     def accepts_per_pass(self) -> float:
@@ -258,6 +259,7 @@ def _speculative(
     draft_s = 0.0
     verify_s = 0.0
     replay_s = 0.0
+    accept_prefix: list[int] = []
     context_ids = tokens.tolist()
     finish = "length"
     t_decode = time.perf_counter()
@@ -330,6 +332,7 @@ def _speculative(
                 break
             n_accept += 1
         accepted_draft += n_accept
+        accept_prefix.append(n_accept)
         bonus = int(pred[n_accept])
         if aux is not None:
             # leftover + accepted drafts become context; bonus is the next leftover.
@@ -407,4 +410,5 @@ def _speculative(
         draft_s=draft_s,
         verify_s=verify_s,
         replay_s=replay_s,
+        accept_prefix=accept_prefix,
     )
