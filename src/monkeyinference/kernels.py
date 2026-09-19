@@ -8,7 +8,9 @@ Weight layout matches MLX / Prism affine 2-bit g128:
 
 Decode (seq=1) is a GEMV (`ternary_qmv`). Spec verify is an 8-row MMA
 (`ternary_qmm_m8`): 256-thread TGs, dequant into threadgroup memory, then
-MPP `matmul2d`. Prefill keeps mx.quantized_matmul.
+MPP `matmul2d`. On this M4 10-core GPU the MMA is flat (T=8/T=1 = 1.00×
+on that kernel) but 2.25× greedy qdot, missing the 1.3× gate. Prefill
+keeps mx.quantized_matmul.
 """
 
 from __future__ import annotations

@@ -4,7 +4,7 @@ Living design-and-results doc. Engine repo: [github.com/ashvinar/monkeyinference
 
 **Headline (2026-09-19):** Decode is DRAM-bandwidth bound. Greedy explain is **10.22 tok/s** (LPM off). Read-only STREAM is **85–94 GB/s**, the same band as copy STREAM **87–94 GB/s** (historical 86.6) — **not** 100–110. Decode resembles a large read, so the ceiling stays **~11.3–12.7 tok/s**, not 13–14. 10.22 is still ~80–90% of it. CPU+GPU disjoint read aggregates **103 GB/s** (GPU 54 + CPU 49); do not build a hybrid path until asked.
 
-Splash decode is a **fixed 8-row MMA**, never a 1-token GEMV. `ternary_qmv_once` is the wrong kernel class; T=8 at 4.8× T=1 is that, not a missing GDN path. Packed codes are genuinely ternary (0 / 3.54e9 code-3). Next: `ternary_qmm_m8` with gate T=8 / T=1 ≤ **1.3×**.
+Splash decode is a **fixed 8-row MMA**, never a 1-token GEMV. `ternary_qmm_m8` is that kernel class: 256-thread TGs, dequant into threadgroup half, MPP `matmul2d(8, 128, 64)`. **On the MMA kernel, T=8 / T=1 is 1.00×** (flat). Versus greedy qdot T=1, T=8 is **2.25×** (stable 1235 / 550 µs on MLP-up) — better than `qmv_once` at 3.8×, short of the **1.3×** gate. `uint2b_format` is in the MPP headers and does **not** compile on this toolchain. Greedy stays on qdot.
 
 ## Machine
 
@@ -66,7 +66,7 @@ Prism's laptop table is llama-bench tg128 depth 0 (no spec): M4 Pro 18 tok/s, M5
 | Text-only load | Vision tower is 0.92 GB FP16 and unused for these prompts. Peak Metal ~8.3 GB. | Keep the tower behind an explicit `--vision` flag later. |
 | Keep Prism activation Hadamard (block 1024, `H(x⊙s)/√1024`) | Weights are stored in that basis. Skipping it is silent garbage. | None. |
 | Default matmul = custom qdot GEMV (`--no-custom` for MLX) | Clone of MLX `qmv_fast`: 64-thread TGs, 2 simdgroups × 4 rows, pre-shifted x, mask-and-accumulate, no bias load (`y = s·(codes·x − Σx)` because Prism stores `bias = −scale`). Hadamard stays `mx.hadamard_transform` immediately before the GEMV (10 KB; inlining a 1024-point FWHT into an output-tiled TG would recompute H(x) per 8 output rows). E2e greedy 8.38 → **9.74**. Layer-level vs MLX `max_abs` 0.013. | `--no-custom`. |
-| Spec verify (M=2..16) = weight-once qdot | MLX stays on `qmv` until M≈12. Our once-kernel loads 4 weight words then serializes M in the inner loop with `acc[16][4]` always allocated. Pipelined M=8 is 3–5× M=1 on real Bonsai shapes, not STREAM-flat. Prefill M>16 stays on `mx.quantized_matmul`. | Wait for the Splash small-M teardown before writing a new tile. |
+| Spec verify (M=2..8) = `ternary_qmm_m8` | Splash decode is leftover+7 as an 8-row MMA. 256-thread TGs, N/128 tiles, K=64 dequant into TG half, then `matmul2d`. Pads M<8. **MMA T=8 / MMA T=1 = 1.00×.** Versus greedy qdot: **2.25×** on MLP-up (gate was 1.3×). M=9..16 still `qmv_once`. Prefill M>16 stays on `mx.quantized_matmul`. | Keep chasing 1.3× vs qdot if a 2-bit device MMA appears; do not pad 2-bit into `uint4b`. |
 | GDN cache pin is copy-on-write, not memcpy | `gated_delta` already writes a new `state_out`; `GatedDeltaNet` does `cache[i] = new`. Holding the previous array refs / KV offsets is a real CoW pin (~151 MB × 48 layers is **not** copied). Partial reject reverts pointers and replays leftover+accepted (GDN is recurrent; no per-timestep states). | If Apple adds trimmable GDN cache, switch. |
 | First draft = prompt-lookup n-gram (PLD), K=5 | Zero extra weights. K=8+ over-proposes on the copy sentence and pays reject+replay. | Tune K per prompt class. |
 | Self-spec draft = first N layers + shared `lm_head` | Vocab 248320 matches by construction; 0 new bytes. N∈{2,4,6,8} all plateau at ~1.07 accepts/pass. | Do not tune N further. |
@@ -193,7 +193,22 @@ Per-call `mx.synchronize` made a first pass look ~flat (launch latency ≈ kerne
 
 Census-weighted (401 linears): predicted GEMV **220 ms at M=1, 689 ms at M=8, ratio 3.13**. Inflated vs in-model T=1 (~84 ms of linears inside 114 ms) because isolated GEMVs do not overlap GDN/Hadamard and `mlp_gate` was cold. In-model T=8 is **553 ms vs 114 ms = 4.83×**.
 
-**Ruling:** amortization of `ternary_qmv_once` is **broken because it is a matvec kernel**, not because a tile is “subtly” failing to keep weights in registers. Splash never runs a 1-token GEMV: decode is compiled as leftover+7, `SPLASH_TARGET_VERIFY_ROWS=8`, `matmul2d_descriptor(8, TileN, 64)`, 256-thread TGs. That is the entire 74 tok/s ≈ 5.4× (15 GiB / 204 GB/s) story. **Do not tune qmv_once further.** Next kernel is `ternary_qmm_m8`: 256-thread TG, dequant into threadgroup memory, then MMA (MPP `matmul2d` if MLX will compile it, else 8-row software MMA with the same TG shape). **Gate: MLP-up 17408×5120, T=8 / T=1 ≤ 1.3×.** Stuffing 2-bit into `uint4b` would double DRAM — do not. Always-8 spec ABI + `verify_gdn_commit` (delete leftover replay) is item 2, after this gate.
+**Ruling:** amortization of `ternary_qmv_once` is **broken because it is a matvec kernel**, not because a tile is “subtly” failing to keep weights in registers. Splash never runs a 1-token GEMV: decode is leftover+7, `SPLASH_TARGET_VERIFY_ROWS=8`, `matmul2d_descriptor(8, TileN, 64)`, 256-thread TGs.
+
+**`ternary_qmm_m8` (LPM off, stable interleaved, MLP-up 17408×5120):**
+
+| Kernel | µs | vs qdot T=1 |
+| --- | ---: | ---: |
+| T=1 qdot (`ternary_gemv`) | **550** | 1.00× |
+| T=8 MMA (shipped) | **1235** | **2.25×** |
+| T=1 padded to 8 on the MMA kernel | 1235-class | MMA T=8 / MMA T=1 = **1.00×** |
+| T=8 `qmv_once` | 2006 | 3.77× |
+| T=8 MLX affine | 1632 | 3.0× |
+| STREAM floor (23.7 MB / 72 GB/s that session) | ~330 | |
+
+The kernel **class** is right: eight rows cost the same as one *on the MMA*. The **1.3× vs greedy qdot** gate is **not** met. Dequant-into-TG then `matmul2d` is ~2.2× a register qdot that never writes 16 KB of unpacked halves. Tried and worse or similar: tile-major packing, K=32/128, TileN=32/64/256, `execution_simdgroups<2/4>`, relaxed precision, int8 TG MMA, simdgroup 8×8 MMA, 256-thread unrolled qdot. `metal::uint2b_format` is listed in the MPP matmul2d tables and **does not compile** (`unknown type name 'uint2b_format'`). Stuffing 2-bit into `uint4b` still doubles DRAM — do not.
+
+This is the Splash teardown’s stated 10-core failure mode (software 2-bit × 8 rows, expect ~12 tok/s not 23). Greedy stays on qdot. Verify M=2..8 uses MMA anyway: 2.25× beats 4.83× in-model. Always-8 ABI + GDN commit is still item 2; it cannot recover a 2.25× verify into a 1.3× verify.
 
 Hadamard is not the 4.8×: `fwht` M=1 vs M=8 is ~0.17–0.24 ms and does not track T.
 
@@ -252,7 +267,7 @@ Tokenizer still warns about the Mistral-Small regex. Outputs were English and co
 
 ```
 src/monkeyinference/
-  kernels.py     Metal STREAM copy/read/write + qdot GEMV + weight-once verify
+  kernels.py     Metal STREAM copy/read/write + qdot GEMV + 8-row MMA verify
   stream_cpu.c   P-core STREAM read (QoS USER_INTERACTIVE) for CPU+GPU aggregate
   hadamard.py    Prism fwht
   packed.py      PackedLinear / PackedEmbedding (qdot default; MLX qmm for prefill)
@@ -283,9 +298,9 @@ Uses the existing `~/.monkey/mlx-venv` (mlx 0.32.0). No second venv. `--no-custo
 
 ## What's left
 
-1. **`ternary_qmm_m8`.** Splash teardown: decode is always 8 rows, 256-thread MMA, not a matvec. Gate T=8 / T=1 ≤ **1.3×** on MLP-up 17408×5120. Until that lands, DFlash’s 3.00 accepts/pass cannot beat 10.22.
-2. **Always-8 spec ABI + `verify_gdn_commit`.** Delete leftover+accepted full-model replay. Survey and Splash independently rank this next. Arithmetic: ~15 tok/s after (1), ~18 with packing.
-3. **DFlash on packed `MDFD0004` with a real Q4 MMA** (the one place Splash’s 4-bit path ports literally). Draft 82→~15 ms is the ~15 vs ~23 band, after (1).
+1. **`ternary_qmm_m8`.** Shipped. MMA is flat (T=8 / padded T=1 = 1.00×). Versus greedy qdot the gate **1.3× is missed at 2.25×** on MLP-up. `uint2b` MMA does not compile here. Keep greedy on qdot; verify M=2..8 on MMA.
+2. **Always-8 spec ABI + `verify_gdn_commit`.** Delete leftover+accepted full-model replay. Does not turn 2.25× into 1.3×; it removes the replay term once verify is whatever it is.
+3. **DFlash on packed `MDFD0004` with a real Q4 MMA** (the one place Splash’s 4-bit path ports literally). Draft 82→~15 ms.
 4. **Five-trit pack** after the histogram (ternary, 0 code-3). Microbench unpack vs qdot on MLP-up; ship if greedy ≥ ~11.5; keep 2-bit fallback. Realized 11.5–13, not 14.7.
 5. **Then** post-Hadamard `|H(x)|` sparsity; TEAL-style qdot only if 30%+ droppable with token identity. Otherwise stop.
 6. Prefill 40.9 vs llama-bench pp512 47 — not the chat bottleneck.
@@ -311,5 +326,5 @@ Added: git repo under `~/projects/monkeyinference` (source). **+1.266 GB** at `~
 - 2026-09-19 **HOLD** GPU **read-only STREAM is the same band as copy** (85–94 vs 87–94 GB/s). Copy wall is ~2× read wall at 512 MiB — same instantaneous bus, 2× traffic. 1 GiB read median 85 GB/s. Decode resembles GPU read. Do not retarget the ceiling to 100–110 GB/s.
 - 2026-09-19 **NEW** CPU+GPU disjoint read aggregates **103 GB/s** vs GPU-only 94 (+10%); GPU drops to 54 under contention. llama.cpp layer-split is existence proof. **Do not build hybrid** until asked.
 - 2026-09-19 **HOLD** mlx_lm GDN prefill and verify are the **same sequential kernel**. Isolated GDN 12% of T=8. WY-chunked GDN remains out of scope.
-- 2026-09-19 **UPDATE** T=8 at 4.8× T=1 is the **wrong kernel class** (`ternary_qmv_once` is a matvec). Splash decode is always M=8 MMA (`q4_mpp_tile`, 256-thread TG). Next: `ternary_qmm_m8`, gate T=8/T=1 ≤ 1.3×. Then always-8 ABI + GDN commit. Then DFlash Q4 MMA on `MDFD0004`.
+- 2026-09-19 **UPDATE** T=8 at 4.8× T=1 was the **wrong kernel class** (`ternary_qmv_once` is a matvec). `ternary_qmm_m8` is the Splash-shaped MMA: **MMA T=8 / MMA T=1 = 1.00×**, **2.25× vs greedy qdot** on MLP-up (gate 1.3× missed). `uint2b_format` does not compile. Then always-8 ABI + GDN commit. Then DFlash Q4 MMA on `MDFD0004`.
 - 2026-09-18 **NEW** Bonsai affine-2bit codes are genuinely **ternary**: **0 / 3.54e9** code-3. Exact-zero (code 1) **32.8%**. 5-trits-per-byte is lossless on the table. Ship only after (1)–(2) and an unpack microbench ≥ ~11.5 greedy.
