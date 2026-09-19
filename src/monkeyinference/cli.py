@@ -20,7 +20,7 @@ def main(argv: list[str] | None = None) -> int:
     p_gen.add_argument("--prompt", default="Name the capital of France. Reply with only the city name.")
     p_gen.add_argument("--max-tokens", type=int, default=32)
     p_gen.add_argument("--speculative", action="store_true")
-    p_gen.add_argument("--draft", choices=("none", "pld", "early"), default="pld")
+    p_gen.add_argument("--draft", choices=("none", "pld", "early", "dflash"), default="pld")
     p_gen.add_argument("--num-draft", type=int, default=None)
     p_gen.add_argument("--early-layers", type=int, default=4)
     p_gen.add_argument("--custom", action=argparse.BooleanOptionalAction, default=True,
@@ -33,6 +33,11 @@ def main(argv: list[str] | None = None) -> int:
     p_bench.add_argument("--out", type=Path, default=None)
     p_bench.add_argument("--parity", type=int, default=8)
     p_bench.add_argument("--quick", action="store_true", help="Skip long prefill; early-exit N=4 only")
+    p_bench.add_argument(
+        "--dflash",
+        action="store_true",
+        help="Measure Splash DFlash 2 accepts/pass on the explain prompt (loads the 1.27 GB draft)",
+    )
 
     args = parser.parse_args(argv)
 
@@ -80,14 +85,20 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "bench":
-        from monkeyinference.bench import run_bench
+        from monkeyinference.bench import run_bench, run_dflash_bench
 
-        rep = run_bench(args.pack, parity_layers=args.parity, quick=args.quick)
+        if args.dflash:
+            rep = run_dflash_bench(args.pack)
+        else:
+            rep = run_bench(args.pack, parity_layers=args.parity, quick=args.quick)
         print(json.dumps(rep, indent=2))
         if args.out:
             args.out.parent.mkdir(parents=True, exist_ok=True)
             args.out.write_text(json.dumps(rep, indent=2))
-        ok = rep.get("coherence_ok") and rep.get("identity_ok")
+        if args.dflash:
+            ok = rep.get("identity_ok")
+        else:
+            ok = rep.get("coherence_ok") and rep.get("identity_ok")
         return 0 if ok else 1
 
     return 2

@@ -263,3 +263,52 @@ def run_bench(
     gc.collect()
     mx.clear_cache()
     return report
+
+
+def run_dflash_bench(pack: str | Path | None = None) -> dict:
+    """Explain-prompt accepts/pass for the Splash DFlash 2 draft vs leftover greedy."""
+    loaded = load_text_model(pack, use_custom_kernels=True)
+    leftover = generate(
+        loaded,
+        EXPLAIN_PROMPT,
+        max_tokens=48,
+        speculative=True,
+        draft="none",
+        parity_layers=0,
+    )
+    dflash = generate(
+        loaded,
+        EXPLAIN_PROMPT,
+        max_tokens=48,
+        speculative=True,
+        draft="dflash",
+        parity_layers=0,
+    )
+    identity = _tokens_match(leftover.tokens, dflash.tokens)
+    coh = _coherence("spec", dflash.text)
+    from pathlib import Path as _P
+
+    draft_dir = _P.home() / ".monkey/models/Qwen3.8-27B-Splash-draft/draft"
+    on_disk = sum(p.stat().st_size for p in draft_dir.glob("*.bin")) if draft_dir.is_dir() else 0
+    report = {
+        "ok": True,
+        "prompt": EXPLAIN_PROMPT,
+        "draft_dir": str(draft_dir),
+        "draft_bytes": on_disk,
+        "draft_gb": on_disk / 1e9,
+        "leftover": _payload(leftover),
+        "dflash": _payload(dflash),
+        "accepts_per_pass": dflash.accepts_per_pass,
+        "accepted_draft": dflash.accepted_draft,
+        "proposed_draft": dflash.proposed_draft,
+        "verify_passes": dflash.verify_passes,
+        "token_identity": identity,
+        "identity_ok": identity,
+        "coherence": coh,
+        "beats_early_exit": dflash.accepts_per_pass > 1.2,
+        "usable": dflash.accepts_per_pass >= 2.0 and identity,
+    }
+    del loaded
+    gc.collect()
+    mx.clear_cache()
+    return report

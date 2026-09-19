@@ -19,7 +19,7 @@ from monkeyinference.spec import (
     revert_cache,
 )
 
-DRAFT_KINDS = ("none", "pld", "early")
+DRAFT_KINDS = ("none", "pld", "early", "dflash")
 
 
 @dataclass
@@ -82,6 +82,8 @@ def _default_num_draft(draft: str) -> int:
         return 5
     if draft == "early":
         return 4
+    if draft == "dflash":
+        return 7
     return 0
 
 
@@ -197,14 +199,24 @@ def _speculative(
 
     early: EarlyExitDrafter | None = None
     draft_cache = None
+    dflash = None
+    aux = None
     if draft_kind == "early":
         early = EarlyExitDrafter(model, early_layers)
         draft_cache = early.make_cache()
+    elif draft_kind == "dflash":
+        from monkeyinference.dflash import AuxCapture, load_drafter
+
+        dflash = load_drafter()
+        aux = AuxCapture(model.model)
     elif draft_kind not in ("pld", "none"):
         raise ValueError(f"unknown draft {draft_kind!r}")
 
-    def target_forward(ids, cache):
-        return model(ids, cache=cache)
+    def target_forward(ids, cache, capture: bool = True):
+        out = model(ids, cache=cache)
+        if capture and aux is not None:
+            aux.record_last_forward()
+        return out
 
     t_pre = time.perf_counter()
     y = _prefill(target_forward, tokens, target_cache, prefill_step)
@@ -240,12 +252,27 @@ def _speculative(
             draft_pin = pin_cache(draft_cache)
             draft_ids = early.propose_from_state(y, draft_cache, k, eos)
             draft_s += time.perf_counter() - t_d
+        elif k > 0 and dflash is not None:
+            t_d = time.perf_counter()
+            ctx = aux.context()
+            leftover = int(y.reshape(-1)[-1].item())
+            if ctx is None:
+                draft_ids = []
+            else:
+                draft_ids = dflash.propose(
+                    aux=ctx,
+                    leftover_token=leftover,
+                    embed=model.model.embed_tokens,
+                    lm_head=model.lm_head,
+                    k=k,
+                )
+            draft_s += time.perf_counter() - t_d
 
         proposed_draft += len(draft_ids)
         if not draft_ids:
             leftover = y
             t_v = time.perf_counter()
-            logits = model(leftover[None], cache=target_cache)
+            logits = target_forward(leftover[None], target_cache, capture=True)
             mx.eval(logits)
             verify_s += time.perf_counter() - t_v
             tok = int(mx.argmax(logits[:, -1, :]).item())
@@ -266,7 +293,7 @@ def _speculative(
         target_pin = pin_cache(target_cache)
         y_run = mx.concatenate([y, mx.array(draft_ids, dtype=mx.uint32)])
         t_v = time.perf_counter()
-        logits = model(y_run[None], cache=target_cache)
+        logits = target_forward(y_run[None], target_cache, capture=True)
         mx.eval(logits)
         verify_s += time.perf_counter() - t_v
         verify_passes += 1
@@ -278,6 +305,9 @@ def _speculative(
             n_accept += 1
         accepted_draft += n_accept
         bonus = int(pred[n_accept])
+        if aux is not None:
+            # leftover + accepted drafts become context; bonus is the next leftover.
+            aux.keep_last_n(1 + n_accept)
 
         if n_accept < len(draft_ids):
             t_r = time.perf_counter()
@@ -287,7 +317,7 @@ def _speculative(
                 if n_accept
                 else y
             )
-            mx.eval(model(replay[None], cache=target_cache))
+            mx.eval(target_forward(replay[None], target_cache, capture=False))
             replay_s += time.perf_counter() - t_r
 
         if early is not None and draft_pin is not None:
@@ -322,6 +352,8 @@ def _speculative(
             break
 
     decode_s = time.perf_counter() - t_decode
+    if aux is not None:
+        aux.close()
     text = tokenizer.decode(generated, skip_special_tokens=True)
     n_gen = len(generated)
     return GenerateResult(
