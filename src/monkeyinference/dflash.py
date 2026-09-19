@@ -71,6 +71,20 @@ def grouped_conv(
     return out.reshape(t, h)
 
 
+class _LayerTap(nn.Module):
+    def __init__(self, inner, store: dict, idx: int):
+        super().__init__()
+        self.inner = inner
+        self._store = store
+        self._idx = idx
+        self.is_linear = getattr(inner, "is_linear", False)
+
+    def __call__(self, *args, **kwargs):
+        y = self.inner(*args, **kwargs)
+        self._store[self._idx] = y
+        return y
+
+
 class AuxCapture:
     """Record residual-stream hiddens at DFlash's five target layer ids."""
 
@@ -78,26 +92,17 @@ class AuxCapture:
         self.ids = TARGET_LAYER_IDS
         self.last: dict[int, mx.array] = {}
         self.tokens: list[mx.array] = []
-        self._bound: list[tuple] = []
+        self._layers = text_model.layers
+        self._orig: dict[int, object] = {}
         for idx in self.ids:
-            layer = text_model.layers[idx]
-            orig = layer.__call__
-
-            def bind(fn, layer_idx):
-                def wrapped(*args, **kwargs):
-                    y = fn(*args, **kwargs)
-                    self.last[layer_idx] = y
-                    return y
-
-                return wrapped
-
-            layer.__call__ = bind(orig, idx)
-            self._bound.append((layer, orig))
+            inner = self._layers[idx]
+            self._orig[idx] = inner
+            self._layers[idx] = _LayerTap(inner, self.last, idx)
 
     def close(self) -> None:
-        for layer, orig in self._bound:
-            layer.__call__ = orig
-        self._bound.clear()
+        for idx, inner in self._orig.items():
+            self._layers[idx] = inner
+        self._orig.clear()
 
     def record_last_forward(self) -> mx.array:
         missing = [i for i in self.ids if i not in self.last]
