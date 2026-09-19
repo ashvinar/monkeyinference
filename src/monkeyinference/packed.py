@@ -13,6 +13,7 @@ from monkeyinference.kernels import (
     ternary_qmm,
     ternary_qmm_m8,
     ternary_qmv_once,
+    ternary_trit_qmm,
 )
 from monkeyinference import parity as parity_mod
 
@@ -44,6 +45,7 @@ class PackedLinear(nn.Module):
         self.block = int(block or 0)
         self.dtype = dtype
         self.use_custom = use_custom
+        self.trit_weight = None
 
     def __call__(self, x: mx.array) -> mx.array:
         if self.block:
@@ -55,6 +57,21 @@ class PackedLinear(nn.Module):
         # M=1 decode: custom qdot GEMV.
         # 2..8: 8-row MMA (pad if needed). 9..16: weight-once qdot.
         # Prefill M>16: MLX qmm.
+        if self.use_custom and rows <= 1 and self.trit_weight is not None:
+            y = ternary_trit_qmm(x, self.trit_weight, self.scales).astype(self.dtype)
+            if parity_mod.PARITY_REMAINING > 0:
+                ref = mlx_affine_qmv(x, self.weight, self.scales, self.biases).astype(
+                    mx.float32
+                )
+                diff = y.astype(mx.float32) - ref
+                mx.eval(diff)
+                absd = mx.abs(diff)
+                parity_mod.record_parity(
+                    float(mx.max(absd).item()),
+                    float(mx.sqrt(mx.mean(diff * diff)).item()),
+                    tuple(int(s) for s in y.shape),
+                )
+            return y
         if self.use_custom and rows <= 1:
             y = ternary_qmm(x, self.weight, self.scales).astype(self.dtype)
             if parity_mod.PARITY_REMAINING > 0:
@@ -102,6 +119,13 @@ class PackedLinear(nn.Module):
             return y
         y = mlx_affine_qmv(x, self.weight, self.scales, self.biases)
         return y.astype(self.dtype)
+
+    def enable_five_trit(self) -> None:
+        """Lossless 5-trit recode of this linear. Keeps 2-bit weights for M>1 MMA."""
+        from monkeyinference.trit import pack_five_trit
+
+        self.trit_weight = pack_five_trit(self.weight)
+        mx.eval(self.trit_weight)
 
 
 class PackedEmbedding(nn.Module):

@@ -26,6 +26,10 @@ M8 = 8
 TILE_N = 128
 K_TILE = 64  # MMA K; two tiles share one g128 scale
 THREADS_M8 = 256
+# Five-trit: 5 codes/byte, each g128 padded to 130 with two code-1 zeros.
+TRITS_PER_BYTE = 5
+PAD_TRITS_PER_GROUP = 2
+BYTES_PER_GROUP = 26  # (128 + 2) / 5
 
 _STREAM_COPY_SRC = r"""
     uint i = thread_position_in_grid.x;
@@ -411,8 +415,108 @@ _qmv_cache: dict[tuple[int, int, int, type], object] = {}
 _qmv_once_cache: dict[tuple[int, int, int, type], object] = {}
 _qmm_cache: dict[tuple[int, int, int, type], object] = {}
 _qmm_m8_cache: dict[tuple[int, int, type], object] = {}
+_qmv_trit_cache: dict[tuple[int, int, type], object] = {}
 
 ROWS_DEFAULT = 8
+
+
+def _five_trit_lut_header() -> str:
+    rows = []
+    for b in range(243):
+        vals = []
+        x = b
+        for _ in range(TRITS_PER_BYTE):
+            vals.append(str(x % 3))
+            x //= 3
+        rows.append("    {" + ", ".join(vals) + "}")
+    return (
+        "constant uchar LUT5[243][5] = {\n"
+        + ",\n".join(rows)
+        + "\n};\n"
+    )
+
+
+_TERNARY_TRIT_QMV_HEADER = "#include <metal_simdgroup>\n" + _five_trit_lut_header()
+
+# 64-thread TGs, 2 simdgroups × 4 rows — same occupancy class as qdot.
+# Each lane walks g128 groups with stride 32, unpacks 26 bytes via LUT5.
+# Five x-values stay in registers (not a 128-wide private array).
+_TERNARY_TRIT_QMV_SRC = r"""
+    const uint lid = thread_index_in_threadgroup;
+    const uint simd_gid = lid / 32u;
+    const uint simd_lid = lid % 32u;
+    const uint tg = threadgroup_position_in_grid.x;
+    const uint token = threadgroup_position_in_grid.y;
+    const uint out_row = tg * 8u + simd_gid * 4u;
+    const uint groups_per_row = K / 128u;
+    const uint bytes_per_row = groups_per_row * 26u;
+    const device T* xrow = x + token * K;
+
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+
+    for (uint g = simd_lid; g < groups_per_row; g += 32u) {
+        const uint kbase = g * 128u;
+        const uint bbase = g * 26u;
+        float xsum = 0.0f;
+        for (uint i = 0; i < 128u; i++) {
+            xsum += float(xrow[kbase + i]);
+        }
+
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        for (uint bi = 0; bi < 26u; bi++) {
+            const uint k0 = bi * 5u;
+            float xt0 = 0.0f, xt1 = 0.0f, xt2 = 0.0f, xt3 = 0.0f, xt4 = 0.0f;
+            if (k0 + 0u < 128u) xt0 = float(xrow[kbase + k0 + 0u]);
+            if (k0 + 1u < 128u) xt1 = float(xrow[kbase + k0 + 1u]);
+            if (k0 + 2u < 128u) xt2 = float(xrow[kbase + k0 + 2u]);
+            if (k0 + 3u < 128u) xt3 = float(xrow[kbase + k0 + 3u]);
+            if (k0 + 4u < 128u) xt4 = float(xrow[kbase + k0 + 4u]);
+
+            #pragma unroll
+            for (uint r = 0; r < 4u; r++) {
+                const uint row = out_row + r;
+                if (row >= N) {
+                    continue;
+                }
+                uint b = uint(w[row * bytes_per_row + bbase + bi]);
+                if (b >= 243u) {
+                    b = 0u;
+                }
+                const float term =
+                    float(LUT5[b][0]) * xt0 +
+                    float(LUT5[b][1]) * xt1 +
+                    float(LUT5[b][2]) * xt2 +
+                    float(LUT5[b][3]) * xt3 +
+                    float(LUT5[b][4]) * xt4;
+                if (r == 0) a0 += term;
+                else if (r == 1) a1 += term;
+                else if (r == 2) a2 += term;
+                else a3 += term;
+            }
+        }
+
+        const float s0 = (out_row + 0u < N) ? float(scales[(out_row + 0u) * groups_per_row + g]) : 0.0f;
+        const float s1 = (out_row + 1u < N) ? float(scales[(out_row + 1u) * groups_per_row + g]) : 0.0f;
+        const float s2 = (out_row + 2u < N) ? float(scales[(out_row + 2u) * groups_per_row + g]) : 0.0f;
+        const float s3 = (out_row + 3u < N) ? float(scales[(out_row + 3u) * groups_per_row + g]) : 0.0f;
+        acc0 += s0 * (a0 - xsum);
+        acc1 += s1 * (a1 - xsum);
+        acc2 += s2 * (a2 - xsum);
+        acc3 += s3 * (a3 - xsum);
+    }
+
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
+    acc2 = simd_sum(acc2);
+    acc3 = simd_sum(acc3);
+    if (simd_lid == 0) {
+        const uint ybase = token * N;
+        if (out_row + 0 < N) y[ybase + out_row + 0] = T(acc0);
+        if (out_row + 1 < N) y[ybase + out_row + 1] = T(acc1);
+        if (out_row + 2 < N) y[ybase + out_row + 2] = T(acc2);
+        if (out_row + 3 < N) y[ybase + out_row + 3] = T(acc3);
+    }
+"""
 
 
 def _stream_copy():
@@ -712,4 +816,50 @@ def mlx_affine_qmv(x: mx.array, weight: mx.array, scales: mx.array, biases: mx.a
         bits=2,
     )
     n = int(y.shape[-1])
+    return mx.reshape(y, orig[:-1] + (n,))
+
+
+def _qmv_trit_kernel(n: int, k: int, dtype):
+    key = (n, k, dtype)
+    kernel = _qmv_trit_cache.get(key)
+    if kernel is None:
+        kernel = mx.fast.metal_kernel(
+            name="monkey_ternary_trit_qmv",
+            input_names=["x", "w", "scales"],
+            output_names=["y"],
+            header=_TERNARY_TRIT_QMV_HEADER,
+            source=_TERNARY_TRIT_QMV_SRC,
+        )
+        _qmv_trit_cache[key] = kernel
+    return kernel
+
+
+def ternary_trit_qmm(
+    x: mx.array,
+    trit_w: mx.array,
+    scales: mx.array,
+) -> mx.array:
+    """y = x @ five-trit_W.T. Codes packed 5-per-byte, g128 padded to 26 bytes."""
+    orig = x.shape
+    x2 = mx.contiguous(
+        mx.reshape(x, (-1, orig[-1])) if x.ndim != 1 else mx.reshape(x, (1, -1))
+    )
+    m, k = int(x2.shape[0]), int(x2.shape[1])
+    n = int(trit_w.shape[0])
+    if k % GROUP:
+        raise ValueError(f"K={k} is not a multiple of group size {GROUP}")
+    expected = (k // GROUP) * BYTES_PER_GROUP
+    if int(trit_w.shape[1]) != expected:
+        raise ValueError(f"trit weight width {trit_w.shape[1]} != {expected} for K={k}")
+    n_tg = (n + 7) // 8
+    y = _qmv_trit_kernel(n, k, x.dtype)(
+        inputs=[x2, trit_w, scales],
+        template=[("T", x.dtype), ("N", n), ("K", k)],
+        grid=(n_tg * 64, m, 1),
+        threadgroup=(64, 1, 1),
+        output_shapes=[(m, n)],
+        output_dtypes=[x.dtype],
+    )[0]
+    if x.ndim == 1:
+        return mx.reshape(y, (n,))
     return mx.reshape(y, orig[:-1] + (n,))

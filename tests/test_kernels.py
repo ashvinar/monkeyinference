@@ -157,6 +157,34 @@ def test_mlx_affine_flattens_3d_like_2d():
     assert err == 0.0, err
 
 
+def test_five_trit_pack_roundtrip():
+    from monkeyinference.trit import pack_five_trit, unpack_five_trit, unpack_affine_2bit
+
+    for n, k in [(8, 128), (32, 512), (17, 256)]:
+        x, w, scales, biases = pack_ternary(n, k, seed=20 + n + k)
+        packed = pack_five_trit(w)
+        mx.eval(packed)
+        codes = unpack_affine_2bit(np.array(w))
+        got = unpack_five_trit(packed, k)
+        assert got.shape == codes.shape
+        assert int(np.max(np.abs(got.astype(np.int16) - codes.astype(np.int16)))) == 0
+        assert int(packed.shape[1]) == (k // 128) * 26
+
+
+def test_five_trit_gemv_matches_qdot():
+    from monkeyinference.trit import pack_five_trit
+    from monkeyinference.kernels import ternary_trit_qmm
+
+    for n, k in [(128, 512), (512, 1024), (1024, 2048)]:
+        x, w, scales, biases = pack_ternary(n, k, seed=30 + n)
+        trit = pack_five_trit(w)
+        got = ternary_trit_qmm(x, trit, scales)
+        ref = ternary_gemv(x, w, scales)
+        mx.eval(got, ref)
+        err = float(mx.max(mx.abs(got.astype(mx.float32) - ref.astype(mx.float32))).item())
+        assert err < 2e-2, (err, n, k)
+
+
 def test_prompt_lookup_drafter():
     d = PromptLookupDrafter(ngram=3, max_draft=4)
     tokens = [1, 2, 3, 4, 5, 1, 2, 3]
