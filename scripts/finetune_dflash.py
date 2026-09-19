@@ -6,7 +6,8 @@ runs LoRA rank-16 on the frozen Q4 draft (~8.6M params, ~0.1 GB Adam,
 
     export PYTHONPATH=src
     ~/.monkey/mlx-venv/bin/python scripts/finetune_dflash.py --scope
-    ~/.monkey/mlx-venv/bin/python scripts/finetune_dflash.py
+    ~/.monkey/mlx-venv/bin/python scripts/finetune_dflash.py --resume
+    scripts/run_dflash_ft_detached.sh --watch <pid>
 """
 
 from __future__ import annotations
@@ -25,15 +26,18 @@ from monkeyinference.dflash_distill import (
     DEFAULT_DIR,
     DISTILL_PROMPTS,
     FrozenHead,
+    MIN_ACCEPTS_TO_BEAT_GREEDY,
     STEP_TIME_ABORT_S,
     collect_sequence,
     evaluate_explain,
+    infer_resume_step,
     iter_windows,
     load_dataset,
+    predicted_k7,
     save_dataset,
     train,
 )
-from monkeyinference.dflash_lora import LORA_RANK, wrap_drafter
+from monkeyinference.dflash_lora import LORA_RANK, load_adapters, wrap_drafter
 from monkeyinference.load import load_text_model
 
 
@@ -114,6 +118,26 @@ def cmd_collect(args) -> dict:
 def cmd_train(args) -> dict:
     out = Path(args.dir)
     rows = load_dataset(out)
+    n_win = sum(1 for row in rows for _ in iter_windows(row))
+    steps = args.steps
+    if steps is None:
+        steps = min(4000, max(400, n_win * 2))
+    start_step = 0
+    adapter_file = out / "adapters.safetensors"
+    if args.resume:
+        start_step = infer_resume_step(out)
+        if start_step >= steps:
+            print(
+                f"  resume: already at step {start_step}/{steps}; skipping train",
+                flush=True,
+            )
+            return {
+                "n_windows": n_win,
+                "steps": steps,
+                "start_step": start_step,
+                "skipped": "already_complete",
+                "aborted": None,
+            }
     print(
         f"=== load draft + wrap LoRA r={LORA_RANK}, {len(rows)} sequences ===",
         flush=True,
@@ -133,11 +157,27 @@ def cmd_train(args) -> dict:
     adapters = wrap_drafter(drafter)
     print(f"  trainable {adapters.n_trainable/1e6:.2f}M params", flush=True)
 
-    n_win = sum(1 for row in rows for _ in iter_windows(row))
-    steps = args.steps
-    if steps is None:
-        steps = min(4000, max(400, n_win * 2))
-    print(f"  windows={n_win} steps={steps} abort if step0>{STEP_TIME_ABORT_S}s", flush=True)
+    if args.resume:
+        if start_step > 0 and adapter_file.is_file():
+            load_adapters(adapters, adapter_file)
+            print(
+                f"  resume from step {start_step}/{steps} using {adapter_file}",
+                flush=True,
+            )
+        elif start_step > 0:
+            print(
+                "  --resume requested but adapters.safetensors is missing; "
+                "starting at 0",
+                flush=True,
+            )
+            start_step = 0
+        else:
+            print("  --resume: no checkpoint; starting at 0", flush=True)
+    print(
+        f"  windows={n_win} steps={steps} start_step={start_step} "
+        f"abort if first step>{STEP_TIME_ABORT_S}s",
+        flush=True,
+    )
     log = train(
         drafter,
         adapters,
@@ -147,6 +187,7 @@ def cmd_train(args) -> dict:
         steps=steps,
         lr=args.lr,
         out=out,
+        start_step=start_step,
     )
     log["free_disk_gb"] = _free_gb()
     (out / "train.json").write_text(json.dumps(log, indent=2))
@@ -178,11 +219,21 @@ def cmd_eval(args) -> dict:
     ev["beats_greedy"] = bool(
         ev["identity_vs_leftover"] and ev["dflash_tps"] > greedy.generation_tps
     )
+    ev["paper_k7"] = predicted_k7(ev["accepts_per_pass"])
+    ev["need_accepts_vs_10_22"] = MIN_ACCEPTS_TO_BEAT_GREEDY
     (Path(args.dir) / "eval.json").write_text(json.dumps(ev, indent=2, default=str))
+    paper = ev["paper_k7"]
     print(
         f"  greedy {greedy.generation_tps:.2f} tok/s  dflash {ev['dflash_tps']:.2f} "
         f"accepts/pass={ev['accepts_per_pass']:.2f} identity={ev['identity_vs_leftover']} "
         f"france={ev['france']!r}",
+        flush=True,
+    )
+    print(
+        f"  paper K=7 replay=0: pred {paper['pred_tok_s']:.2f} tok/s "
+        f"(need {paper['min_accepts_to_beat_10_22']:.2f} accepts, "
+        f"have {paper['accepts_per_pass']:.2f}, "
+        f"wins={paper['wins_on_paper']})",
         flush=True,
     )
     return ev
@@ -199,6 +250,11 @@ def main() -> int:
     p.add_argument("--max-new", type=int, default=96)
     p.add_argument("--steps", type=int, default=None)
     p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue from adapters.safetensors + train_state.json / run.log",
+    )
     args = p.parse_args()
     if args.scope:
         return cmd_scope()

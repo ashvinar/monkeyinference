@@ -128,15 +128,21 @@ def time_propose(dflash, leftover: int, embed, lm_head, k: int, n=5, warmup=2) -
     }
 
 
-def table_rows(t1_ms: float, t8_ms: float, draft: dict[int, float]) -> list[dict]:
+def table_rows(
+    t1_ms: float,
+    t8_ms: float,
+    draft: dict[int, float],
+    accepts_map: dict[int, float] | None = None,
+) -> list[dict]:
     greedy_ms = 1000.0 / GREEDY_TPS
     verify_ratio = t8_ms / t1_ms if t1_ms else None
+    acc_src = ACCEPTS if accepts_map is None else accepts_map
     rows = []
     for k in range(1, 8):
         d_ms = draft[k]
         pass_ms = t8_ms + d_ms  # replay = 0 (GDN prefix commit)
         min_accepts = GREEDY_TPS * pass_ms / 1000.0
-        accepts = ACCEPTS.get(k)
+        accepts = acc_src.get(k)
         pred = None if accepts is None else accepts / (pass_ms / 1000.0)
         draft_block = d_ms / greedy_ms
         draft_per_token = d_ms / (k * greedy_ms)
@@ -167,23 +173,50 @@ def table_rows(t1_ms: float, t8_ms: float, draft: dict[int, float]) -> list[dict
     return rows
 
 
-def main() -> None:
-    out = OUT_DEFAULT
+def main(argv: list[str] | None = None) -> None:
+    import argparse
+
+    p = argparse.ArgumentParser()
+    p.add_argument("--out", type=Path, default=OUT_DEFAULT)
+    p.add_argument("--accepts-k7", type=float, default=None)
+    p.add_argument(
+        "--eval-json",
+        type=Path,
+        default=Path.home() / ".monkey/dflash-ft/eval.json",
+    )
+    p.add_argument("--skip-gdn", action="store_true")
+    args = p.parse_args(argv)
+
+    accepts = dict(ACCEPTS)
+    if args.accepts_k7 is not None:
+        accepts[7] = float(args.accepts_k7)
+    elif args.eval_json.is_file():
+        ev = json.loads(args.eval_json.read_text())
+        if "accepts_per_pass" in ev:
+            accepts[7] = float(ev["accepts_per_pass"])
+
+    out = args.out
     out.parent.mkdir(parents=True, exist_ok=True)
     report: dict = {
         "greedy_tps": GREEDY_TPS,
         "gemv_mma_ratio": GEMV_MMA_RATIO,
-        "accepts_from_k_sweep": ACCEPTS,
+        "accepts_from_k_sweep": accepts,
         "replay": 0,
+        "adapter_eval_json": str(args.eval_json) if args.eval_json.is_file() else None,
         "note": (
             "DFlash propose always builds leftover+MASK×7 then select() walks k. "
             "Draft backbone is ~flat in K. Verify is always-8 MMA (PackedLinear "
-            "already pads M<8). GDN commit assumed (no leftover replay)."
+            "already pads M<8). GDN commit assumed (no leftover replay). "
+            "K=7 accepts come from leftover-protocol eval when --eval-json is set."
         ),
     }
 
-    print("=== isolated GDN (commit-cost proxy) ===", flush=True)
-    report["gdn"] = bench_gdn()
+    if args.skip_gdn:
+        report["gdn"] = None
+        print("=== skip isolated GDN ===", flush=True)
+    else:
+        print("=== isolated GDN (commit-cost proxy) ===", flush=True)
+        report["gdn"] = bench_gdn()
 
     print("=== load Bonsai + DFlash ===", flush=True)
     t_load = time.perf_counter()
@@ -273,7 +306,9 @@ def main() -> None:
 
     greedy_ms = 1000.0 / GREEDY_TPS
     report["greedy_ms"] = greedy_ms
-    report["table"] = table_rows(t1["median_ms"], t8["median_ms"], draft)
+    report["table"] = table_rows(
+        t1["median_ms"], t8["median_ms"], draft, accepts_map=accepts
+    )
 
     winners = [r for r in report["table"] if r["wins_on_paper"] is True]
     close = [

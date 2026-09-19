@@ -286,6 +286,85 @@ def _lr_at(step: int, steps: int, base: float, warmup: int) -> float:
     return 0.1 * base + 0.9 * base * 0.5 * (1.0 + math.cos(math.pi * p))
 
 
+CKPT_EVERY = 200  # adapters land on step % CKPT_EVERY == CKPT_EVERY-1
+# Mix-pass verify + K=7 draft from docs/ternary-engine.md (2026-09-19).
+STOCK_T8_MS = 298.0
+STOCK_DRAFT_K7_MS = 46.2
+GREEDY_TPS = 10.22
+MIN_ACCEPTS_TO_BEAT_GREEDY = GREEDY_TPS * (STOCK_T8_MS + STOCK_DRAFT_K7_MS) / 1000.0
+
+
+def _write_state(out: Path, *, step: int, steps: int, loss: float) -> None:
+    payload = {
+        "step": int(step),
+        "steps": int(steps),
+        "loss": float(loss),
+        "updated_unix": time.time(),
+    }
+    (out / "train_state.json").write_text(json.dumps(payload, indent=2))
+
+
+def read_train_state(out: Path) -> dict | None:
+    path = Path(out) / "train_state.json"
+    if not path.is_file():
+        return None
+    return json.loads(path.read_text())
+
+
+def infer_resume_step(out: Path) -> int:
+    """Next train() start_step from on-disk state.
+
+    Prefer train_state.json (`step` is the next index to run). Else parse
+    run.log: adapters are saved when step % 200 == 199, so a logged step S
+    resumes at (S // 200) * 200 unless that save just landed (S % 200 == 199),
+    in which case resume at S + 1. Missing files → 0.
+    """
+    out = Path(out)
+    state = read_train_state(out)
+    if state is not None and "step" in state:
+        return max(0, int(state["step"]))
+    log_path = out / "run.log"
+    last = None
+    if log_path.is_file():
+        import re
+
+        pat = re.compile(r"step (\d+)/(\d+)")
+        for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            m = pat.search(line)
+            if m:
+                last = int(m.group(1))
+    if last is None:
+        return 0
+    if last % CKPT_EVERY == CKPT_EVERY - 1:
+        return last + 1
+    return (last // CKPT_EVERY) * CKPT_EVERY
+
+
+def predicted_k7(
+    accepts: float,
+    *,
+    t8_ms: float = STOCK_T8_MS,
+    draft_ms: float = STOCK_DRAFT_K7_MS,
+    greedy_tps: float = GREEDY_TPS,
+) -> dict:
+    """Replay=0 paper row for K=7. Draft/verify ms default to the mix-pass table."""
+    pass_ms = float(t8_ms) + float(draft_ms)
+    min_accepts = greedy_tps * pass_ms / 1000.0
+    pred = float(accepts) / (pass_ms / 1000.0)
+    return {
+        "k": 7,
+        "draft_ms": float(draft_ms),
+        "verify_always8_ms": float(t8_ms),
+        "pass_ms_replay0": pass_ms,
+        "accepts_per_pass": float(accepts),
+        "pred_tok_s": pred,
+        "min_accepts_to_beat_10_22": min_accepts,
+        "wins_on_paper": float(accepts) > min_accepts,
+        "greedy_tps": greedy_tps,
+        "beats_greedy_margin_tok_s": pred - greedy_tps,
+    }
+
+
 def train(
     drafter: DFlashDrafter,
     adapters: nn.Module,
@@ -296,6 +375,7 @@ def train(
     steps: int,
     lr: float = 1e-4,
     out: Path,
+    start_step: int = 0,
     timed_step_abort_s: float = STEP_TIME_ABORT_S,
 ) -> dict:
     windows: list[tuple[int, int]] = []
@@ -305,6 +385,10 @@ def train(
     if not windows:
         raise RuntimeError("no training windows")
     rng = np.random.default_rng(0)
+    # Advance the window RNG to match a resumed step so we do not
+    # repeat the same prefix of samples.
+    for _ in range(max(start_step, 0)):
+        rng.integers(0, len(windows))
     opt = optim.AdamW(learning_rate=lr)
     warmup = max(20, steps // 25)
 
@@ -322,10 +406,11 @@ def train(
         "n_windows": len(windows),
         "n_trainable": int(adapters.n_trainable),
         "steps": steps,
+        "start_step": int(start_step),
         "aborted": None,
     }
 
-    for step in range(steps):
+    for step in range(start_step, steps):
         i, t = windows[int(rng.integers(0, len(windows)))]
         opt.learning_rate = _lr_at(step, steps, lr, warmup)
         mx.synchronize()
@@ -341,12 +426,13 @@ def train(
         lv = float(loss.item())
         losses.append(lv)
         nrm = float(norm.item()) if hasattr(norm, "item") else float(norm)
-        if step == 0 and elapsed > timed_step_abort_s:
+        if step == start_step and elapsed > timed_step_abort_s:
             log["aborted"] = (
                 f"first step {elapsed:.2f}s > {timed_step_abort_s}s abort; "
                 f"projected {steps * elapsed / 3600:.1f} hours"
             )
             save_adapters(adapters, out / "adapters.abort.safetensors")
+            _write_state(out, step=step, steps=steps, loss=lv)
             log["first_step_s"] = elapsed
             log["first_loss"] = lv
             return log
@@ -356,11 +442,13 @@ def train(
                 f"lr={opt.learning_rate:.2e} clip_norm={nrm:.2f}",
                 flush=True,
             )
-        if step % 200 == 199:
+        if step % CKPT_EVERY == CKPT_EVERY - 1 or step == steps - 1:
             mx.clear_cache()
             save_adapters(adapters, out / "adapters.safetensors")
+            _write_state(out, step=step + 1, steps=steps, loss=lv)
 
     save_adapters(adapters, out / "adapters.safetensors")
+    _write_state(out, step=steps, steps=steps, loss=losses[-1] if losses else 0.0)
     log["first_step_s"] = t_steps[0]
     log["median_step_s"] = float(sorted(t_steps)[len(t_steps) // 2])
     log["mean_loss_last50"] = float(np.mean(losses[-50:]))

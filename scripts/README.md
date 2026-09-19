@@ -10,7 +10,8 @@ These scripts produced the tables in `docs/ternary-engine.md`. They are not part
 | `probe_bandwidth.py` | GPU copy/read/write STREAM, CPU read, CPU+GPU aggregate |
 | `probe_code_histogram.py` | On-disk affine-2bit codes: 0 of 3.54e9 code-3 |
 | `probe_gdn_path.py` | mlx_lm GDN prefill vs verify: same sequential kernel |
-| `finetune_dflash.py` | LoRA distill of DFlash onto 2-bit Bonsai (see `docs/ternary-engine.md`) |
+| `finetune_dflash.py` | LoRA distill of DFlash onto 2-bit Bonsai (`--resume` continues from adapters) |
+| `run_dflash_ft_detached.sh` | tmux + `caffeinate -dims` wrapper; `--watch PID` resumes if that trainer dies |
 
 ```bash
 export PYTHONPATH=src
@@ -18,6 +19,9 @@ export PYTHONPATH=src
 ~/.monkey/mlx-venv/bin/python scripts/probe_bandwidth.py
 ~/.monkey/mlx-venv/bin/python scripts/probe_mixed.py
 ~/.monkey/mlx-venv/bin/python scripts/finetune_dflash.py --scope
+# long run: detached from the agent session, Mac kept awake
+scripts/run_dflash_ft_detached.sh
+scripts/run_dflash_ft_detached.sh --watch <pid>
 ```
 
 `results/*.json` is gitignored. One-off kernel-tuning probes on disk are not tracked.
