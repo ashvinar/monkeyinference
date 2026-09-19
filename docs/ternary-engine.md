@@ -248,11 +248,13 @@ Authorized experiment: fine-tune the existing Splash DFlash 2 Q4 draft onto 2-bi
 | Adapter | `~/.monkey/dflash-ft/adapters.safetensors` (33 MB) |
 | Identity | leftover-greedy verify. Stock, LoRA, and greedy tokens matched on explain. France → `Paris`. |
 
-Need **>3.51** accepts/pass to beat 10.22 on paper. Stock baseline **3.00**. LoRA held-out **2.09**. Documented miss; did not start a second long run.
+Need **>3.51** accepts/pass to beat 10.22 on paper, or **>3.70** against the clean-compare greedy of **10.75** (93 ms/token × 344.2 ms pass). Stock baseline **3.00**. LoRA held-out **2.09**. That run overfit 64 prompts.
+
+**Bounded retry (one shot).** Same teacher, not from-scratch. 1200 disjoint chat/explain/code/long-context prompts (hold out explain + 7 others). Select checkpoints on held-out explain accepts, never train loss. LoRA r=8, scale 1.0, lr 3e-5, AdamW wd 0.1, 2000 steps. Kill if held-out explain accepts is not **above 3.00** by midpoint. Final bar **3.70**; if never exceeded, speculation is closed. Cache: `~/.monkey/dflash-ft2/` (the overfit 33 MB adapter stays in `dflash-ft/`). Windows must be ≥ **30320** (10× 3032). Prize if it actually hits published 4.1–5.5: roughly **12–16 tok/s** (1.1–1.5×), real but not past STREAM.
 
 ## The closed lead: acceptance gap
 
-If anyone reopens speculation, this is still the only remaining lever, and a different training recipe would be required. The LoRA run above is that experiment; it overfit. Do not chase another kernel.
+If this bounded retry fails the 3.70 bar, speculation is closed on this Air. Do not chase another kernel.
 
 DFlash K=7 stock, 48 gen, 16 verify passes, 3.00 accepts/pass, token-identical. Mean **2.00** draft tokens accepted per pass (plus bonus). First-reject slot (stock, compare run — same 3/6/2/2/1/1/0/1 histogram as the original k_sweep):
 
@@ -408,4 +410,4 @@ Safe to delete if Ashvin wants the bytes back — see the README disk section. T
 - 2026-09-19 **HOLD** five-trit unpack. Synthetic global switch 0.88×. **Per-shape mix on real weights: 0 winning (N,K)** (1.31–2.14×). Mixed greedy **10.21 tok/s**, leftover-identical. Keep 2-bit. Does not move T=8 MMA.
 - 2026-09-19 **NEW** After mix, break-even still short: T=8 298 ms, need **3.51** accepts, have 3.00, predicted **8.71 tok/s**. DFlash K=7 e2e **5.07 tok/s** with MMA+replay, identity-ok. Rejects front-loaded (19% slot 0, 38% after one). Acceptance gap, not kernels.
 - 2026-09-19 **NEW** LoRA r=16 distill of Splash DFlash 2 Q4 onto 2-bit Bonsai: 64 sequences / 3032 windows / 5000 steps, identity-safe leftover-greedy verify. Held-out explain **2.09 accepts/pass** vs stock **3.00**. Same-run greedy **10.75**, stock DFlash **5.68**, LoRA **3.68**. Paper K=7 replay=0: pred **6.06** tok/s, need **3.51**. Overfit; adapters opt-in; production dflash stays stock Q4.
-- 2026-09-19 **CLOSE** no remaining software path on this Air materially beats ~11 tok/s. Binding constraint is GPU STREAM ~86.6 GB/s. Engine is at the hardware’s greedy limit. Faster means more memory bandwidth (a different Mac). Training the existing draft with this LoRA recipe did not move the needle the right way.
+- 2026-09-19 **RETRY** one bounded LoRA: 1200 diverse prompts, r=8, wd=0.1, 2000 steps, select on held-out explain accepts. Midpoint kill if not above **3.00**. Win bar **3.70** (= 10.75 tok/s × 344.2 ms pass). Prize at published 4.1–5.5 would be ~12–16 tok/s. If it misses 3.70, speculation is closed.

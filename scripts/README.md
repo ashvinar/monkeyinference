@@ -10,8 +10,8 @@ These scripts produced the tables in `docs/ternary-engine.md`. They are not part
 | `probe_bandwidth.py` | GPU copy/read/write STREAM, CPU read, CPU+GPU aggregate |
 | `probe_code_histogram.py` | On-disk affine-2bit codes: 0 of 3.54e9 code-3 |
 | `probe_gdn_path.py` | mlx_lm GDN prefill vs verify: same sequential kernel |
-| `finetune_dflash.py` | LoRA distill of DFlash onto 2-bit Bonsai (`--resume` continues from adapters) |
-| `run_dflash_ft_detached.sh` | tmux + `caffeinate -dims` wrapper; `--watch PID` resumes if that trainer dies |
+| `finetune_dflash.py` | LoRA distill retry: 1200 prompts, r=8, held-out accepts, `~/.monkey/dflash-ft2/` |
+| `run_dflash_ft_detached.sh` | tmux + `caffeinate -dims`; default dir `dflash-ft2` |
 
 ```bash
 export PYTHONPATH=src

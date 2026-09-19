@@ -1,8 +1,7 @@
 """LoRA on the existing Splash Q4 DFlash draft.
 
-Full fine-tune of 1.80B draft weights needs ~25 GB (fp16 + fp32 master + Adam)
-and does not fit in 15 GB free / 24 GB unified. LoRA rank-16 is 8.6M params
-(~104 MB Adam). B is zero-init so step 0 equals the working Q4 draft.
+r=16 / 5000 steps overfit 64 prompts. Retry uses rank-8, scale 1.0,
+higher weight decay. B is zero-init so step 0 equals the working Q4 draft.
 """
 
 from __future__ import annotations
@@ -15,9 +14,10 @@ from mlx.utils import tree_flatten, tree_unflatten
 
 from monkeyinference.splash_q4 import Q4Linear
 
-DEFAULT_ADAPTERS = Path.home() / ".monkey/dflash-ft/adapters.safetensors"
-LORA_RANK = 16
-LORA_SCALE = 2.0
+DEFAULT_ADAPTERS = Path.home() / ".monkey/dflash-ft2/adapters.best.safetensors"
+# r=16 + 5000 steps overfit 64 prompts. Retry: lower rank, smaller scale, stay near stock.
+LORA_RANK = 8
+LORA_SCALE = 1.0
 
 
 class LoRAQ4(nn.Module):

@@ -27,85 +27,23 @@ from monkeyinference.dflash import (
     reset_drafter,
 )
 from monkeyinference.dflash_lora import save_adapters
+from monkeyinference.dflash_prompts import distill_prompts
 from monkeyinference.generate import generate
 from monkeyinference.hadamard import fwht
 from monkeyinference.load import apply_chat, load_text_model
 
-DEFAULT_DIR = Path.home() / ".monkey/dflash-ft"
+DEFAULT_DIR = Path.home() / ".monkey/dflash-ft2"
 BLOCK = 8  # leftover + 7 MASK, matches propose()
 LOSS_GAMMA = 4.0  # paper: γ=4 for block size 8
 STEP_TIME_ABORT_S = 8.0  # 10k × 8s is a many-hour run; stop and report
+CKPT_EVERY = 100
+MIN_WINDOWS = 30320  # 10× the overfit run's 3032
+AUX_BUDGET_GB = 6.5
+MIN_FREE_GB = 3.5
 
 # Held out of the distill set. Success is measured on EXPLAIN_PROMPT.
 EVAL_PROMPTS = (EXPLAIN_PROMPT, FRANCE_PROMPT)
-
-DISTILL_PROMPTS: list[tuple[str, int]] = [
-    # (user prompt, max new tokens). Chat / explanation / code.
-    ("What is speculative decoding, and why does it help on a memory-bound GPU?", 64),
-    ("Explain residual connections in a transformer in two short paragraphs.", 64),
-    ("Give a practical checklist for reviewing a Python pull request.", 64),
-    ("How does a Hadamard transform differ from a DFT? Keep it concrete.", 48),
-    ("Write a Python function that merges two sorted lists without allocating extra lists beyond the output.", 80),
-    ("Explain gated delta networks as if I have used Mamba but not GDN.", 64),
-    ("What should I pack for a three-day hiking trip in the Cascades in September?", 48),
-    ("Debug this: a Metal kernel compiles but returns zeros. Where do you look first?", 64),
-    ("Summarize copy-on-write vs memcpy for a recurrent state cache.", 48),
-    ("Write a bash loop that prints the ten largest files under a directory.", 48),
-    ("Why might 2-bit quantization change a language model's next-token distribution?", 64),
-    ("Explain DRAM bandwidth vs compute roofline for a 27B GEMV.", 64),
-    ("Draft a polite email asking a teammate to review a performance regression.", 48),
-    ("Implement binary search in Python over a list of integers, with tests in comments.", 80),
-    ("What is block diffusion, in the sense used by speculative draft models?", 64),
-    ("How do I keep a MacBook Air cool while running a long GPU job?", 40),
-    ("Explain token identity as a correctness gate for speculative decoding.", 48),
-    ("Write a regex that matches IPv4 addresses and mention a false-positive.", 48),
-    ("Compare LoRA and full fine-tuning when the base weights are 4-bit.", 64),
-    ("What's a good way to structure a living design doc for a systems project?", 48),
-    ("Explain why fp16 residuals can break a draft model when activations are ~1e4.", 64),
-    ("Write a Python dataclass for a generate() result with tok/s fields.", 64),
-    ("How does prompt-lookup decoding differ from a trained drafter?", 48),
-    ("Give three reasons a Q4 GEMM can beat a 2-bit GEMV on small-M batches.", 64),
-    ("Walk through git rebase vs merge for a long-lived feature branch.", 48),
-    ("Write a SQL query that counts orders per day for the last 14 days.", 40),
-    ("What is a threadgroup in Metal, and why does 256 threads matter for MMA?", 64),
-    ("Explain the difference between accepts/pass and tokens per second.", 48),
-    ("Implement FizzBuzz in Rust, then in Python, both under 20 lines.", 64),
-    ("How would you teach a new hire to read a STREAM benchmark?", 48),
-    ("Describe a chat-app feature that summarizes a long thread in one paragraph.", 48),
-    ("Why freeze a quantized backbone and train adapters instead of dequantizing?", 64),
-    ("Write a Makefile target that runs unit tests and a short bench.", 40),
-    ("Explain KV cache pins versus rebuilding the cache after a rejected draft.", 64),
-    ("What's the difference between greedy decoding and sampling at temp 1.0?", 48),
-    ("Give a short architecture review of a 5-layer draft sitting under a 64-layer target.", 64),
-    ("Write a Python generator that yields sliding windows of length 8.", 48),
-    ("How do I interpret a front-loaded rejection histogram in speculative decoding?", 64),
-    ("Explain unified memory on Apple silicon in one paragraph for a CUDA person.", 48),
-    ("Draft a README section: hardware assumptions and honest performance numbers.", 64),
-    ("What does it mean for a pack to be lossless-ternary but slower to unpack?", 48),
-    ("Write a function that computes cross-entropy of logits vs integer targets in numpy.", 64),
-    ("How should I choose K for a block-diffusion drafter that always runs 8 query rows?", 48),
-    ("Explain why leftover-greedy is the right identity baseline for speculation.", 48),
-    ("A user asks: is my laptop slow or is the model just big? Answer carefully.", 48),
-    ("Write a pytest for a function that packs 5 ternary codes per byte.", 64),
-    ("What is an occupancy artifact in a GEMV microbench?", 48),
-    ("Describe a good on-call handoff note after a failed training run.", 40),
-    ("Compare attention and GDN layers in Qwen3.5-style models at a high level.", 64),
-    ("Write a Python CLI with argparse for collect/train/eval subcommands.", 64),
-    ("Why might a draft be right on token 1 and collapse after?", 48),
-    ("Explain cosine LR with warmup without formulas first, then give the formula.", 48),
-    ("How do you keep secrets out of a git repo that has a results/ folder?", 40),
-    ("Implement a ring buffer of token ids in Python with a fixed capacity.", 48),
-    ("What should a performance claim include besides tok/s?", 48),
-    ("Give an example of a chat turn that asks for a refactor, then one that asks for an explanation.", 48),
-    ("Why is AdamW state so large compared to the trainable parameter count?", 48),
-    ("Write a short comment-only walkthrough of rms_norm in float32.", 40),
-    ("How would you estimate wall-clock for 5000 GPU training steps from one timed step?", 40),
-    ("Explain the difference between a seed main branch and a feature branch on GitHub.", 40),
-    ("A teammate inverted a speedup ratio. Write the correction without being snide.", 40),
-    ("What is the smallest experiment that would tell you a drafter adapted to a quantized target?", 48),
-    ("Write a JSON schema for a break-even table row (k, draft_ms, pred_tok_s).", 40),
-    ("Explain why you would not delete someone else's GGUF to free training disk.", 40),
-]
+DISTILL_PROMPTS: list[tuple[str, int]] = distill_prompts(n=1200)
 
 
 class FrozenHead:
@@ -201,29 +139,39 @@ def collect_sequence(loaded, user: str, max_tokens: int) -> dict:
 
 def save_dataset(rows: list[dict], directory: Path) -> dict:
     directory = Path(directory)
+    summary = {"n_sequences": 0, "n_windows": 0, "aux_bytes": 0, "directory": str(directory)}
+    for i, row in enumerate(rows):
+        summary = append_sequence(row, directory, i)
+    return summary
+
+
+def append_sequence(row: dict, directory: Path, index: int) -> dict:
+    """Write one teacher sequence. Does not keep aux in RAM after the npy lands."""
+    directory = Path(directory)
     aux_dir = directory / "aux"
     aux_dir.mkdir(parents=True, exist_ok=True)
-    meta = []
-    bytes_aux = 0
-    for i, row in enumerate(rows):
-        path = aux_dir / f"{i:04d}.npy"
-        np.save(path, row["aux"])
-        bytes_aux += path.stat().st_size
-        meta.append(
-            {
-                "prompt": row["prompt"],
-                "prompt_len": row["prompt_len"],
-                "tokens": row["tokens"],
-                "text": row["text"],
-                "gen_tokens": row["gen_tokens"],
-                "aux": str(path.name),
-                "n_aux": int(row["aux"].shape[0]),
-            }
-        )
-    (directory / "meta.json").write_text(json.dumps(meta, indent=2))
-    n_win = sum(
-        max(0, len(m["tokens"]) - 7 - max(m["prompt_len"] - 1, 0)) for m in meta
-    )
+    path = aux_dir / f"{index:04d}.npy"
+    np.save(path, row["aux"])
+    rec = {
+        "prompt": row["prompt"],
+        "prompt_len": row["prompt_len"],
+        "tokens": row["tokens"],
+        "text": row["text"],
+        "gen_tokens": row["gen_tokens"],
+        "aux": path.name,
+        "n_aux": int(row["aux"].shape[0]),
+    }
+    meta_path = directory / "meta.json"
+    meta = json.loads(meta_path.read_text()) if meta_path.is_file() else []
+    if index < len(meta):
+        meta[index] = rec
+    elif index == len(meta):
+        meta.append(rec)
+    else:
+        raise RuntimeError(f"append index {index} skips meta len {len(meta)}")
+    meta_path.write_text(json.dumps(meta, indent=2))
+    bytes_aux = sum((aux_dir / m["aux"]).stat().st_size for m in meta)
+    n_win = sum(1 for m in meta for _ in iter_windows(m))
     return {
         "n_sequences": len(meta),
         "n_windows": n_win,
@@ -233,22 +181,27 @@ def save_dataset(rows: list[dict], directory: Path) -> dict:
 
 
 def load_dataset(directory: Path) -> list[dict]:
+    """Meta only. Aux is memmapped per window so 6 GB datasets fit next to 27B."""
     directory = Path(directory)
     meta = json.loads((directory / "meta.json").read_text())
-    rows = []
-    for m in meta:
-        aux = np.load(directory / "aux" / m["aux"])
-        rows.append({**m, "aux": aux})
-    return rows
+    return [{**m, "aux_path": directory / "aux" / m["aux"]} for m in meta]
 
 
 def iter_windows(row: dict, *, block_tail: int = PROPOSAL_TOKENS):
+    """Assistant-token leftover windows only (not user-prompt internals)."""
     tokens = row["tokens"]
     prompt_len = int(row["prompt_len"])
     t0 = max(prompt_len - 1, 0)
     last = len(tokens) - block_tail - 1
     for t in range(t0, last + 1):
         yield t
+
+
+def _aux_prefix(row: dict, t: int) -> mx.array:
+    if "aux" in row and not isinstance(row["aux"], (str, Path)):
+        return mx.array(row["aux"][: t + 1])
+    mm = np.load(row["aux_path"], mmap_mode="r")
+    return mx.array(np.ascontiguousarray(mm[: t + 1]))
 
 
 def block_loss(
@@ -288,12 +241,17 @@ def _lr_at(step: int, steps: int, base: float, warmup: int) -> float:
     return 0.1 * base + 0.9 * base * 0.5 * (1.0 + math.cos(math.pi * p))
 
 
-CKPT_EVERY = 200  # adapters land on step % CKPT_EVERY == CKPT_EVERY-1
-# Mix-pass verify + K=7 draft from docs/ternary-engine.md (2026-09-19).
+# Mix-pass T=8 + K=7 draft (docs/ternary-engine.md). Historical 10.22 bar is 3.52.
 STOCK_T8_MS = 298.0
 STOCK_DRAFT_K7_MS = 46.2
 GREEDY_TPS = 10.22
 MIN_ACCEPTS_TO_BEAT_GREEDY = GREEDY_TPS * (STOCK_T8_MS + STOCK_DRAFT_K7_MS) / 1000.0
+# Clean-compare greedy 10.75 tok/s = 93.0 ms/token. Pass = 298 + 46.2 = 344.2 ms
+# = 3.70 greedy-token-equivalents. LoRA draft at ~73 ms would raise this further.
+MEASURED_GREEDY_TPS = 10.75
+WIN_ACCEPTS = MEASURED_GREEDY_TPS * (STOCK_T8_MS + STOCK_DRAFT_K7_MS) / 1000.0
+MIDPOINT_MIN_ACCEPTS = 3.00
+STOCK_ACCEPTS = 3.00
 
 
 def _write_state(out: Path, *, step: int, steps: int, loss: float) -> None:
@@ -375,10 +333,15 @@ def train(
     rows: list[dict],
     *,
     steps: int,
-    lr: float = 1e-4,
+    lr: float = 3e-5,
     out: Path,
     start_step: int = 0,
     timed_step_abort_s: float = STEP_TIME_ABORT_S,
+    weight_decay: float = 0.1,
+    ckpt_every: int = CKPT_EVERY,
+    holdout_eval=None,
+    midpoint_min: float = MIDPOINT_MIN_ACCEPTS,
+    win_accepts: float = WIN_ACCEPTS,
 ) -> dict:
     windows: list[tuple[int, int]] = []
     for i, row in enumerate(rows):
@@ -387,30 +350,81 @@ def train(
     if not windows:
         raise RuntimeError("no training windows")
     rng = np.random.default_rng(0)
-    # Advance the window RNG to match a resumed step so we do not
-    # repeat the same prefix of samples.
     for _ in range(max(start_step, 0)):
         rng.integers(0, len(windows))
-    opt = optim.AdamW(learning_rate=lr)
+    opt = optim.AdamW(learning_rate=lr, weight_decay=weight_decay)
     warmup = max(20, steps // 25)
 
     def loss_for(idx_t: tuple[int, int]):
         i, t = idx_t
         row = rows[i]
-        aux = mx.array(row["aux"])
+        aux = _aux_prefix(row, t)
         return block_loss(drafter, embed, head, aux, row["tokens"], t)
 
     loss_and_grad = nn.value_and_grad(adapters, lambda _m, wt: loss_for(wt))
 
     losses: list[float] = []
     t_steps: list[float] = []
+    ckpt_eval: list[dict] = []
+    best_explain = -1.0
+    best_step = -1
     log = {
         "n_windows": len(windows),
         "n_trainable": int(adapters.n_trainable),
         "steps": steps,
         "start_step": int(start_step),
+        "lr": lr,
+        "weight_decay": weight_decay,
+        "ckpt_every": ckpt_every,
+        "win_accepts": win_accepts,
+        "midpoint_min": midpoint_min,
         "aborted": None,
+        "killed": None,
+        "best_explain_accepts": None,
+        "best_step": None,
     }
+
+    def run_holdout(step: int, *, tag: str) -> dict | None:
+        nonlocal best_explain, best_step
+        if holdout_eval is None:
+            return None
+        print(f"  === holdout eval step={step} ({tag}) ===", flush=True)
+        ev = holdout_eval(step)
+        ev = {**ev, "step": step, "tag": tag}
+        ckpt_eval.append(ev)
+        with (out / "ckpt_eval.jsonl").open("a") as fh:
+            fh.write(json.dumps(ev, default=str) + "\n")
+        explain = ev.get("explain_accepts")
+        mean = ev.get("mean_accepts")
+        print(
+            f"  holdout step {step}: explain={explain} mean={mean} "
+            f"(stock={STOCK_ACCEPTS} win={win_accepts:.2f})",
+            flush=True,
+        )
+        if explain is not None and float(explain) > best_explain:
+            best_explain = float(explain)
+            best_step = step
+            save_adapters(adapters, out / "adapters.best.safetensors")
+            (out / "best.json").write_text(
+                json.dumps(
+                    {
+                        "step": step,
+                        "explain_accepts": best_explain,
+                        "mean_accepts": mean,
+                        "tag": tag,
+                    },
+                    indent=2,
+                )
+            )
+            print(f"  new best explain accepts={best_explain:.3f} at step {step}", flush=True)
+        return ev
+
+    if start_step == 0:
+        save_adapters(adapters, out / "adapters.best.safetensors")
+        run_holdout(0, tag="step0_stock")
+
+    midpoint = steps // 2
+    midpoint_checked = start_step > midpoint
 
     for step in range(start_step, steps):
         i, t = windows[int(rng.integers(0, len(windows)))]
@@ -444,20 +458,92 @@ def train(
                 f"lr={opt.learning_rate:.2e} clip_norm={nrm:.2f}",
                 flush=True,
             )
-        if step % CKPT_EVERY == CKPT_EVERY - 1 or step == steps - 1:
+        at_ckpt = step % ckpt_every == ckpt_every - 1 or step == steps - 1
+        if at_ckpt:
             mx.clear_cache()
             save_adapters(adapters, out / "adapters.safetensors")
             _write_state(out, step=step + 1, steps=steps, loss=lv)
+            ev = run_holdout(step + 1, tag="ckpt")
+            if ev is not None and not midpoint_checked and (step + 1) >= midpoint:
+                midpoint_checked = True
+                explain = ev.get("explain_accepts")
+                best = best_explain if best_explain >= 0 else explain
+                if best is None or float(best) <= midpoint_min:
+                    log["killed"] = (
+                        f"midpoint step {step + 1}: best explain accepts="
+                        f"{best} not above {midpoint_min}. Stop."
+                    )
+                    print("STOP:", log["killed"], flush=True)
+                    break
 
-    save_adapters(adapters, out / "adapters.safetensors")
-    _write_state(out, step=steps, steps=steps, loss=losses[-1] if losses else 0.0)
-    log["first_step_s"] = t_steps[0]
-    log["median_step_s"] = float(sorted(t_steps)[len(t_steps) // 2])
-    log["mean_loss_last50"] = float(np.mean(losses[-50:]))
-    log["first_loss"] = losses[0]
-    log["losses_every_25"] = losses[::25] + ([losses[-1]] if losses else [])
-    log["wall_s"] = float(sum(t_steps))
+    if t_steps:
+        save_adapters(adapters, out / "adapters.safetensors")
+        _write_state(out, step=log.get("killed") and (step + 1) or steps, steps=steps, loss=losses[-1])
+        log["first_step_s"] = t_steps[0]
+        log["median_step_s"] = float(sorted(t_steps)[len(t_steps) // 2])
+        log["mean_loss_last50"] = float(np.mean(losses[-50:]))
+        log["first_loss"] = losses[0]
+        log["losses_every_25"] = losses[::25] + ([losses[-1]] if losses else [])
+        log["wall_s"] = float(sum(t_steps))
+    log["ckpt_eval"] = ckpt_eval
+    log["best_explain_accepts"] = None if best_explain < 0 else best_explain
+    log["best_step"] = None if best_step < 0 else best_step
+    log["win"] = bool(best_explain > win_accepts)
+    # Restore the selected checkpoint for the caller.
+    best_path = out / "adapters.best.safetensors"
+    if best_path.is_file():
+        from monkeyinference.dflash_lora import load_adapters
+
+        load_adapters(adapters, best_path)
+        save_adapters(adapters, out / "adapters.safetensors")
+        print(
+            f"  restored best adapters from step {best_step} "
+            f"explain={best_explain}",
+            flush=True,
+        )
     return log
+
+
+def evaluate_holdout(loaded, prompts: list[tuple[str, int]], *, num_draft: int = 7) -> dict:
+    """Accepts/pass on a disjoint set. Weighted by verify_passes."""
+    rows = []
+    weighted = 0.0
+    passes = 0
+    explain_acc = None
+    explain_draft_ms = None
+    for user, ntok in prompts:
+        spec = generate(
+            loaded,
+            user,
+            max_tokens=ntok,
+            speculative=True,
+            draft="dflash",
+            num_draft=num_draft,
+        )
+        acc = spec.accepts_per_pass
+        rows.append(
+            {
+                "prompt": user[:96],
+                "accepts_per_pass": acc,
+                "verify_passes": spec.verify_passes,
+                "tps": spec.generation_tps,
+                "draft_s": spec.draft_s,
+                "verify_s": spec.verify_s,
+            }
+        )
+        weighted += acc * spec.verify_passes
+        passes += spec.verify_passes
+        if user == EXPLAIN_PROMPT:
+            explain_acc = acc
+            if spec.verify_passes:
+                explain_draft_ms = 1000.0 * spec.draft_s / spec.verify_passes
+    return {
+        "mean_accepts": (weighted / passes) if passes else 0.0,
+        "explain_accepts": explain_acc,
+        "verify_passes": passes,
+        "explain_draft_ms_per_pass": explain_draft_ms,
+        "rows": rows,
+    }
 
 
 def _reject_hist(prefix) -> dict:

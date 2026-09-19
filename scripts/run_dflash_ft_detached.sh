@@ -9,8 +9,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DIR="${DFLASH_FT_DIR:-$HOME/.monkey/dflash-ft}"
-SESSION="${TMUX_SESSION:-dflash-ft}"
+DIR="${DFLASH_FT_DIR:-$HOME/.monkey/dflash-ft2}"
+SESSION="${TMUX_SESSION:-dflash-ft2}"
 PYTHON="${PYTHON:-$HOME/.monkey/mlx-venv/bin/python}"
 LOG="$DIR/run.log"
 WATCH_PID=""
@@ -49,7 +49,7 @@ launch_train_teed() {
   if tmux has-session -t "$SESSION" 2>/dev/null; then
     tmux kill-session -t "$SESSION"
   fi
-  local argstr="--dir $DIR --max-new 80 --steps 5000 --resume"
+  local argstr="--dir $DIR --max-new 48 --steps 2000 --resume --lr 3e-5 --rank 8 --weight-decay 0.1"
   if [[ ${#EXTRA[@]} -gt 0 ]]; then
     argstr="$argstr ${EXTRA[*]}"
   fi
