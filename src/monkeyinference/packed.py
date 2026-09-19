@@ -21,8 +21,9 @@ from monkeyinference import parity as parity_mod
 class PackedLinear(nn.Module):
     """Ternary affine-2bit linear with optional input Hadamard.
 
-    Decode (M=1) may use the custom qdot GEMV (`use_custom=True`).
-    Speculative verify (M=2..8) uses the 8-row MMA. Prefill (M>16) uses
+    Decode (M=1) may use the custom qdot GEMV (`use_custom=True`), or
+    five-trit if this (N,K) won the real-weight gate. Speculative verify
+    (M=2..8) uses the 8-row MMA on 2-bit weights. Prefill (M>16) uses
     MLX quantized matmul.
     """
 

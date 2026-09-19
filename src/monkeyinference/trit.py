@@ -125,8 +125,11 @@ def iter_packed_linears(model):
 
 
 # Shapes where five-trit GEMV beat 2-bit qdot by ≥5% on real Bonsai
-# weights (interleaved). 2.02× on mlp_up is a LOSS (trit slower). Updated
-# after calibrate_five_trit_wins(); empty means all-2-bit.
+# weights, interleaved. Calibrated 2026-09-19: **no winners**. Every unique
+# (N,K) was 1.31–2.14× slower than qdot. The earlier synthetic 0.60–0.72×
+# “wins” were qdot occupancy artifacts, not a format advantage. 2.02× on
+# mlp_up is a LOSS (trit slower). Empty frozenset = all 2-bit, which is the
+# per-shape max (cannot do worse than 2-bit).
 TRIT_WIN_NK: frozenset[tuple[int, int]] = frozenset()
 TRIT_WIN_MARGIN = 0.95  # trit must be < 95% of qdot wall
 LM_HEAD_N_SKIP = 100_000  # do not pack 248320-row lm_head during calibrate

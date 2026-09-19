@@ -16,7 +16,7 @@ Bonsai's geometry matches Qwen3.8-27B, but Splash only loads `splash-packed-q4` 
 - Greedy decode, leftover-greedy, prompt-lookup speculative decode, early-exit self-speculation, and Splash DFlash 2 leftover-verify
 - Coherence + token-identity gates wired into `monkeyinference bench`
 
-On this Air, greedy explain is **10.22 tok/s** (Low Power Mode off; 9.74 is the same band), 80–90% of a read-like STREAM ceiling of **11.3–12.7 tok/s**. Same-prompt PLD copy is **11.70 tok/s vs 8.19 leftover greedy** (10/10, token-identical). Early-exit plateaus at **1.07 accepts/pass**. Splash DFlash 2 transfers at **3.00 accepts/pass** (K=7). Always-8 MMA + measured draft + replay=0 predicts **9.39 tok/s** (need 3.26 accepts) — speculation is formally dead at current acceptance. Five-trit is lossless and **0.88×** qdot (HOLD). Hybrid CPU/GPU is ruled out. Training a new draft is not required to clear 2× accepts/pass; it is also not enough to beat greedy on this GPU.
+On this Air, greedy explain is **10.21–10.22 tok/s** (Low Power Mode off), 80–90% of a read-like STREAM ceiling of **11.3–12.7 tok/s**. Same-prompt PLD copy is **11.70 tok/s vs 8.19 leftover greedy** (10/10, token-identical). Early-exit plateaus at **1.07 accepts/pass**. Splash DFlash 2 transfers at **3.00 accepts/pass** (K=7). Per-shape five-trit wins **0** real (N,K); mixed greedy stays **10.21**, leftover-identical. Always-8 MMA + measured draft + replay=0 still needs 3.26–3.51 accepts. Rejects are front-loaded. Hybrid CPU/GPU is ruled out. Codes are genuinely ternary (0/3.54e9 code-3).
 
 ## Run
 

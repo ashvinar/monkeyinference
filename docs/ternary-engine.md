@@ -2,11 +2,11 @@
 
 Living design-and-results doc. Engine repo: [github.com/ashvinar/monkeyinference](https://github.com/ashvinar/monkeyinference) · branch `cursor/ternary-metal-engine-09ea`. Standalone Metal/MLX runtime, not a Splash fork.
 
-**Headline (2026-09-19):** Decode is DRAM-bandwidth bound. Greedy explain is **10.22 tok/s** (LPM off). Read-only STREAM is **85–94 GB/s**, the same band as copy STREAM **87–94 GB/s** (historical 86.6) — **not** 100–110. Ceiling stays **~11.3–12.7 tok/s**. 10.22 is ~80–90% of it. **Hybrid CPU/GPU is ruled out.**
+**Headline (2026-09-19):** Decode is DRAM-bandwidth bound. Greedy explain is **10.21–10.22 tok/s** (LPM off). Read-only STREAM is **85–94 GB/s**, the same band as copy — **not** 100–110. Ceiling stays **~11.3–12.7 tok/s**. **Hybrid CPU/GPU is ruled out.** Codes are **genuinely ternary** (0 of 3.54e9 code-3) — the survey’s packing condition is resolved.
 
-Splash-shaped spec is always-8 MMA plus a block-diffusion draft. MMA is flat on that kernel (T=8/T=1 = 1.00×) but **2.68× e2e** vs qdot T=1 (277 / 103 ms; GEMV-only 2.25× on MLP-up). DFlash propose is leftover+MASK×7, **37–42 ms, almost flat in K**. With GDN commit (replay=0), **no K beats 10.22**: best is K=7 at **9.39 tok/s** (3.00 accepts/pass; need **3.26**). Speculation is formally dead at the current acceptance. If reopened, chase 3.00 → 4.1 accepts, not another kernel.
+Splash-shaped spec is always-8 MMA plus block-diffusion draft. T=8 MMA is **2.68–2.93×** e2e vs qdot T=1. DFlash propose is **37–46 ms, flat in K**. Replay=0 still needs **3.26–3.51** accepts to beat greedy; we have **3.00**. Per-shape five-trit does not move this: on real weights, trit loses on **every** (N,K). Speculation stays dead at current acceptance. Rejects are front-loaded (19% fail at draft slot 0; 38% die after one). If reopened, chase 3.00 → 4.1, not kernels.
 
-Five-trit is lossless (0 of 3.54e9 code-3) and **not** the 11.5–13 greedy lever: census-weighted **0.88×** vs qdot, predicted **9.00 tok/s**. Keep 2-bit qdot. `uint2b_format` does not compile. Do not build always-8+`verify_gdn_commit` — it predicts 9.39.
+Five-trit pack is lossless and gated per shape. Real-weight interleaved microbench: **0 winning shapes**. Mixed greedy **10.21 tok/s**, token-identical to leftover. Keep 2-bit qdot.
 
 ## Machine
 
@@ -47,14 +47,15 @@ Each greedy decode token streams the language weights once (GEMV), plus a neglig
 | 10.22 / 12.7 512 MiB-read ceiling | **80%** |
 | PLD copy-prompt (same prompt as leftover greedy) | **11.70** |
 | five-trit briefing (5.975 GB, copy 86.6) | 14.5 *(not realized; unpack HOLD)* |
-| five-trit census-weighted prediction | **9.00** (0.88× qdot) |
-| DFlash K=7 always-8 MMA, replay=0, 3.00 accepts | **9.39** predicted; need 3.26 to beat 10.22 |
+| five-trit global synthetic | 9.00 predicted (0.88×; do not use) |
+| five-trit per-shape on real weights | **0 winners**; mixed greedy **10.21** |
+| DFlash K=7 always-8 MMA, replay=0, 3.00 accepts | **8.71–9.39** predicted; need 3.26–3.51 |
 
 **Read vs copy.** Ashvin’s objection is right in principle: copy STREAM bills read+write, decode is almost pure read. On this Air it does **not** raise the ceiling into 13–14 tok/s. A Metal reduce-to-scalar (4096 TGs × 256 threads, stride over the buffer, `simd_sum` + one store per TG so loads cannot be DCE’d) lands **in the same band as copy**. At 512 MiB, billed copy 89 GB/s vs read 92 GB/s: the copy kernel takes ~2× the wall of the read kernel, which is exactly 2× the traffic at the same instantaneous bus rate. At 1 GiB, read median **85 GB/s** is slightly *below* copy **94 GB/s**. Thermal swing is ±10 GB/s; do not treat a single 93.7 as 110. **Decode resembles GPU read of a many-GB stream. Keep 11.3–12.7 as the greedy ceiling. 10.22 still has a few percent of STREAM slack, not a second qdot project’s worth.**
 
 **CPU+GPU aggregate.** 4 P-core C threads (clang -O3, 8-wide float add, QoS USER_INTERACTIVE) on a **disjoint** 512 MiB buffer while the GPU read kernel runs: **102.8 GB/s** combined vs **93.7 GPU-only** that session (+10%). Under contention the GPU drops to **54 GB/s** and the CPU to **49** (CPU-only was 72). The extra bytes are real; llama.cpp layer-split is existence proof of the mechanics. **Hybrid decode is ruled out.** Both hypotheses died: read-only is not 100–110 GB/s, and the aggregate does not survive contention. Do not build a layer-split path.
 
-Five-trit packing at 5.975 GB (26/32 of the 2-bit codes, g128 padded to 130): briefing 86.6/5.975 = 14.5 tok/s. **Realized HOLD.** Census-weighted unpack GEMV is **0.88×** 2-bit qdot (mlp_up 2.02×; some GDN/attn shapes 0.60–0.72×). Predicted greedy **9.00 tok/s**. The 11.5–13 survey number assumed the unpack was cheaper than the bytes saved. On this 10-core GPU mlp_up qdot is ALU/occupancy bound (~32–43 GB/s), so extra LUT unpack loses. Keep 2-bit qdot. The packer and kernel stay in-tree behind `PackedLinear.enable_five_trit` with tests; they are not production decode.
+Five-trit packing at 5.975 GB (26/32 of the 2-bit codes, g128 padded to 130): briefing 86.6/5.975 = 14.5 tok/s. **Realized HOLD, including per-shape mix.** A global switch was 0.88× on synthetic weights (mlp_up 2.02× *slower*, some GDN/attn 0.60–0.72×). Those “wins” were qdot occupancy artifacts: on **real Bonsai tensors**, interleaved, five-trit loses on every unique (N,K) (1.31–2.14×). Per-shape max(qdot, trit) therefore equals all-2-bit. Mixed greedy **10.21 tok/s**, token-identical. Production decode stays 2-bit qdot. Kernel + `apply_mixed_five_trit` stay in-tree.
 
 Profiling **does not contradict** the two original rulings:
 
@@ -73,7 +74,7 @@ Prism's laptop table is llama-bench tg128 depth 0 (no spec): M4 Pro 18 tok/s, M5
 | Default matmul = custom qdot GEMV (`--no-custom` for MLX) | Clone of MLX `qmv_fast`: 64-thread TGs, 2 simdgroups × 4 rows, pre-shifted x, mask-and-accumulate, no bias load (`y = s·(codes·x − Σx)` because Prism stores `bias = −scale`). Hadamard stays `mx.hadamard_transform` immediately before the GEMV (10 KB; inlining a 1024-point FWHT into an output-tiled TG would recompute H(x) per 8 output rows). E2e greedy 8.38 → **9.74**. Layer-level vs MLX `max_abs` 0.013. | `--no-custom`. |
 | Spec verify (M=2..8) = `ternary_qmm_m8` | Splash decode is leftover+7 as an 8-row MMA. 256-thread TGs, N/128 tiles, K=64 dequant into TG half, then `matmul2d`. Pads M<8. **MMA T=8 / MMA T=1 = 1.00×.** Versus greedy qdot: **2.25×** GEMV / **2.68× e2e**. M=9..16 still `qmv_once`. Prefill M>16 stays on `mx.quantized_matmul`. Leftover+k is already flat at 273–282 ms for k=1..7. | Do not pad 2-bit into `uint4b`. Do not build GDN-commit always-8 — predicts 9.39. |
 | Hybrid CPU/GPU decode | Measured 103 GB/s aggregate; GPU halves under contention. | **Ruled out.** |
-| Five-trit greedy pack | Lossless (0 code-3). 26 bytes / g128 (−18.75%). | **HOLD.** Unpack 0.88× qdot census-wide. Keep 2-bit. |
+| Five-trit greedy pack | Lossless (0 code-3). Per-shape gate. | **HOLD.** Real-weight interleaved: 0 winning (N,K). All 1.31–2.14× vs qdot. |
 | GDN cache pin is copy-on-write, not memcpy | `gated_delta` already writes a new `state_out`; `GatedDeltaNet` does `cache[i] = new`. Holding the previous array refs / KV offsets is a real CoW pin (~151 MB × 48 layers is **not** copied). Partial reject reverts pointers and replays leftover+accepted (GDN is recurrent; no per-timestep states). | If Apple adds trimmable GDN cache, switch. |
 | First draft = prompt-lookup n-gram (PLD), K=5 | Zero extra weights. K=8+ over-proposes on the copy sentence and pays reject+replay. | Tune K per prompt class. |
 | Self-spec draft = first N layers + shared `lm_head` | Vocab 248320 matches by construction; 0 new bytes. N∈{2,4,6,8} all plateau at ~1.07 accepts/pass. | Do not tune N further. |
@@ -193,9 +194,28 @@ Pass = T=8 verify + propose(k). Predicted tok/s = accepts / pass. Min accepts to
 
 The back-of-envelope `accepts > 2.25 + K × draft_step` uses the MLP-up GEMV ratio and would call K=7 a win (3.00 > 2.68). E2e T=8 is **2.68×** T=1, and 10.22 is 97.8 ms not 103.3, so the table that gates “beat greedy” needs **3.26**. Draft is **0.38–0.43 greedy steps for the whole block**; writing it as K× overstates the K=1 cost and matches K=7 only because propose is flat.
 
-**Ruling:** no K beats 10.22 on paper. Best predicted **9.39 tok/s** at K=7 (8% short). Do **not** build always-8 + `verify_gdn_commit` — leftover+k is already MMA-flat, and deleting replay still lands at 9.39. A Q4 MMA that cut draft 42→15 ms would make pass 292 ms, min accepts 2.98, and 3.00 would “win” 10.27 — thermal noise, not a project. If spec is reopened, chase the **acceptance gap** (3.00 vs published 4.1–5.5). At 4.1 / 0.319 s ≈ **12.9 tok/s** on this cost model.
+**Ruling:** no K beats 10.22 on paper. Best predicted **9.39 tok/s** at K=7 (8% short). Do **not** build always-8 + `verify_gdn_commit` — leftover+k is already MMA-flat, and deleting replay still lands at 9.39.
 
-The 3.99 tok/s K=7 e2e row above is the pre-MMA loop (verify 513 ms/pass `qmv_once` + 155 ms replay). MMA without replay is the 9.39 prediction. Peak Metal this session **9.51 GB**.
+**After per-shape five-trit (same Air, LPM off):** trit won **0** shapes on real weights, so T=1/T=8 did not improve. Remeasured T=1 **101.7 ms**, T=8 **298.1 ms** (2.93×). Draft 39–46 ms. Mixed greedy **10.21 tok/s** (token-identical to leftover; France → `Paris`). K=7 predicted **8.71 tok/s** (need **3.51** accepts). Spec still short. MMA stays 2-bit because no shape wants five-trit even at M=1.
+
+### Acceptance gap (DFlash K=7, 48 gen, token-identical)
+
+16 verify passes, 3.00 accepts/pass, **5.07 tok/s** e2e with MMA+replay (was 3.99 on `qmv_once`). Mean **2.00** draft tokens accepted per pass (plus bonus). First-reject slot:
+
+| Drafts accepted before reject | passes | frac |
+| ---: | ---: | ---: |
+| 0 (slot 0) | 3 | **19%** |
+| 1 | 6 | **38%** |
+| 2 | 2 | 12.5% |
+| 3 | 2 | 12.5% |
+| 4 | 1 | 6% |
+| 5 | 1 | 6% |
+| 6 | 0 | 0% |
+| 7 (full K) | 1 | 6% |
+
+Rejections are **front-loaded**, not uniform scatter: 56% of passes die at 0 or 1. The first draft token is usually right (81%) and the block then falls over. That matches a target distribution the drafter was not trained on, not a random unpack bug. Draft Q4 unpack vs numpy is already gated (synthetic max abs 0.044; fp16 residual zeros accepts). Residual stays float32. Did not train.
+
+The 3.99 tok/s K=7 e2e row in the k_sweep table is the pre-MMA loop (verify 513 ms/pass `qmv_once` + replay). MMA without replay is the 8.71–9.39 prediction. Peak Metal this session **9.89 GB**.
 
 ### GDN path: prefill and verify are the same sequential kernel
 
@@ -270,7 +290,7 @@ This is the Splash teardown’s stated 10-core failure mode (software 2-bit × 8
 
 Hadamard is not the 4.8×: `fwht` M=1 vs M=8 is ~0.17–0.24 ms and does not track T.
 
-### Packed codes are genuinely ternary
+### Packed codes are genuinely ternary — resolved
 
 Sampled 18 PackedLinear tensors from the on-disk safetensors (no GPU load): `embed_tokens`, `lm_head`, GDN qkv/out, MLP up/down, full-attn q/k/v/o, at layers 0 / 3 / 31 / 63. Affine-2bit g128, 16 codes per uint32. **3,538,944,000 codes.**
 
@@ -281,19 +301,22 @@ Sampled 18 PackedLinear tensors from the on-disk safetensors (no GPU load): `emb
 
 Every quantization group in the sample is ternary-only (no code 3, 0% of groups use 4 levels). Exact-zero fraction is the code-1 rate, **32.8%**, stable across tensors (embed is a hair heavier on c0: 0.343 / 0.328 / 0.329). Layer 31 has no `linear_attn` (it is full-attn); GDN is represented by layer 0.
 
-**Read:** a 5-trits-per-byte pack (`3^5 = 243 < 256`) is a **lossless re-encoding**. Layout: 26 bytes per g128 (128 codes + 2 pad-ones), 26/32 = **−18.75%** vs 2-bit. Codes 6.822 GB → 5.543 GB; stream with scales+signs ≈ **5.975 GB**. Briefing STREAM 86.6 / 5.975 ≈ **14.5 tok/s**.
+**Read:** a 5-trits-per-byte pack (`3^5 = 243 < 256`) is a **lossless re-encoding**. Layout: 26 bytes per g128 (128 codes + 2 pad-ones), 26/32 = **−18.75%** vs 2-bit. Codes 6.822 GB → 5.543 GB; stream with scales+signs ≈ **5.975 GB**. Briefing STREAM 86.6 / 5.975 ≈ **14.5 tok/s**. **This packing question is resolved on the histogram: the weights are ternary, so the pack is lossless.** The remaining question was unpack vs qdot, now also resolved against five-trit on this GPU.
 
-**HOLD after unpack microbench (LPM off, pipelined, vs the same-run qdot):**
+**HOLD after per-shape gate on real weights (LPM off, interleaved qdot vs trit, one tensor per unique (N,K)):**
 
-| Shape | N×K | trit/qdot | notes |
+| Shape | N×K | trit/qdot | gate |
 | --- | ---: | ---: | --- |
-| mlp_up | 17408×5120 | **2.02×** | ALU-bound qdot ~32 GB/s; unpack loses |
-| mlp_down | 5120×17408 | 1.12× | |
-| gdn_qkv / gdn_z / attn_q / attn_o | | **0.60–0.72×** | some wins |
-| lm_head (8192-row slice, scaled) | 248320×5120 | 1.86× | |
-| census-weighted (401 linears) | | **0.88×** | predicted greedy **9.00 tok/s** |
+| mlp gate/up | 17408×5120 | **1.64×** | 2-bit |
+| mlp_down | 5120×17408 | 1.59× | 2-bit |
+| gdn_qkv | 10240×5120 | 2.14× | 2-bit |
+| gdn_z | 6144×5120 | 1.81× | 2-bit |
+| gdn_out / attn_o | 5120×6144 | 1.74× | 2-bit |
+| attn_q | 12288×5120 | 2.09× | 2-bit |
+| attn_k/v | 1024×5120 | 1.31× | 2-bit |
+| lm_head | 248320×5120 | skipped (pack tax) | 2-bit |
 
-Pack roundtrip is exact. GEMV vs qdot max-abs 0 on 1024×2048, 0.0625 on mlp_up (fp16 accum order). Do **not** convert the 27B pack. Kernel + `PackedLinear.enable_five_trit` stay in-tree; production decode stays 2-bit qdot. The 11.5–13 survey number assumed unpack cheaper than the bytes saved. It is not, on this GPU, on the shapes that dominate the stream.
+Synthetic-weight 0.60–0.72× “wins” on GDN/attn did **not** reproduce. 2.02× on mlp_up was never a win (ratio is trit/qdot; >1 means slower). Per-shape max equals all-2-bit. Mixed greedy **10.21 tok/s**, leftover-identical. Do not convert. `apply_mixed_five_trit` keeps the gate for a future kernel.
 
 ### LPM-throttled rows (do not compare to 10.22)
 
@@ -328,6 +351,8 @@ MLX itself will not switch `qmv`→`qmm` on Bonsai MLP-up until M≈12. Spec lef
   - leftover greedy == PLD on the copy prompt
   - leftover greedy == early-exit N=4 on explain (48 tok)
   - leftover greedy == DFlash 2 on explain (48 tok, K∈{2,3,7}, also == stream greedy)
+  - mixed five-trit greedy == leftover greedy on explain (48 tok; mix enabled 0 linears)
+  - leftover greedy == DFlash K=7 after mix (48 tok, reject histogram recorded)
 
 A fast engine emitting plausible-looking noise, or a spec loop that silently diverges on reject, would have failed this loop. It did not.
 
@@ -338,7 +363,7 @@ Tokenizer still warns about the Mistral-Small regex. Outputs were English and co
 ```
 src/monkeyinference/
   kernels.py     Metal STREAM copy/read/write + qdot GEMV + 8-row MMA + five-trit GEMV
-  trit.py        5-trits-per-byte pack/unpack (g128 padded to 26 bytes)
+  trit.py        5-trits-per-byte pack/unpack + per-shape mix gate
   stream_cpu.c   P-core STREAM read (QoS USER_INTERACTIVE) for CPU+GPU aggregate
   hadamard.py    Prism fwht
   packed.py      PackedLinear / PackedEmbedding (qdot default; MLX qmm for prefill)
@@ -365,17 +390,18 @@ export PYTHONPATH=src
 ~/.monkey/mlx-venv/bin/python -m monkeyinference.cli bench --dflash --out results/dflash.json
 ~/.monkey/mlx-venv/bin/python scripts/probe_five_trit.py
 ~/.monkey/mlx-venv/bin/python scripts/probe_breakeven.py
+~/.monkey/mlx-venv/bin/python scripts/probe_mixed.py
 ```
 
 Uses the existing `~/.monkey/mlx-venv` (mlx 0.32.0). No second venv. `--no-custom` forces the Prism MLX matmul.
 
 ## What's left
 
-1. **`ternary_qmm_m8`.** Shipped. MMA is flat. Versus greedy qdot **2.25× GEMV / 2.68× e2e** (1.3× gate missed). `uint2b` does not compile. Greedy stays on qdot.
-2. **Always-8 + `verify_gdn_commit`.** **Not building.** Leftover+k is already MMA-flat (273–282 ms). Replay=0 predicts **9.39 tok/s** at K=7 (need 3.26 accepts). Table is the evidence speculation is dead at current acceptance.
-3. **DFlash Q4 MMA.** Draft is already **37–42 ms** isolated. Cutting to 15 ms is a 0.05 tok/s paper win at 3.00 accepts. Skip.
-4. **Five-trit pack.** **HOLD.** Lossless, 0.88× qdot census-wide, predicted 9.00 tok/s. Keep 2-bit qdot. Kernel stays behind `enable_five_trit`.
-5. If spec is reopened: **acceptance gap** 3.00 → 4.1+, not kernels. Token identity still gates any e2e claim.
+1. **`ternary_qmm_m8`.** Shipped. MMA is flat. **2.25× GEMV / 2.68–2.93× e2e**. Greedy stays on qdot.
+2. **Always-8 + GDN commit.** **Not building.** Replay=0 still needs 3.26–3.51 accepts; we have 3.00.
+3. **DFlash Q4 MMA.** Draft already 37–46 ms. Skip.
+4. **Five-trit.** **HOLD.** Per-shape gate on real weights: **0 winners**. Mixed greedy 10.21, identity-ok.
+5. **Acceptance gap** is the only remaining spec lever (3.00 vs published 4.1–5.5). Rejects are front-loaded. Do not train. Token identity still gates any e2e claim.
 6. **Then** post-Hadamard `|H(x)|` sparsity; TEAL-style qdot only if 30%+ droppable with token identity. Otherwise stop.
 7. Prefill 40.9 vs llama-bench pp512 47 — not the chat bottleneck.
 
@@ -401,6 +427,7 @@ Added: git repo under `~/projects/monkeyinference` (source). **+1.266 GB** at `~
 - 2026-09-19 **NEW** CPU+GPU disjoint read aggregates **103 GB/s** vs GPU-only 94 (+10%); GPU drops to 54 under contention. llama.cpp layer-split is existence proof. **Hybrid decode ruled out.**
 - 2026-09-19 **HOLD** mlx_lm GDN prefill and verify are the **same sequential kernel**. Isolated GDN 12% of T=8. WY-chunked GDN remains out of scope.
 - 2026-09-19 **UPDATE** T=8 at 4.8× T=1 was the **wrong kernel class** (`ternary_qmv_once` is a matvec). `ternary_qmm_m8` is the Splash-shaped MMA: **MMA T=8 / MMA T=1 = 1.00×**, **2.25× vs greedy qdot** on MLP-up / **2.68× e2e** (103 → 277 ms). `uint2b_format` does not compile.
-- 2026-09-19 **NEW** DFlash break-even with measured draft and replay=0: propose is **37–42 ms flat in K**. No K beats 10.22. Best **9.39 tok/s** at K=7 (3.00 accepts; need **3.26**). Do not build always-8+GDN commit. If spec is reopened, chase acceptance 3.00→4.1, not kernels.
-- 2026-09-18 **NEW** Bonsai affine-2bit codes are genuinely **ternary**: **0 / 3.54e9** code-3. Exact-zero (code 1) **32.8%**.
-- 2026-09-19 **HOLD** five-trit unpack. Lossless pack, census-weighted **0.88×** qdot, predicted greedy **9.00 tok/s**. mlp_up 2.02×. Keep 2-bit qdot.
+- 2026-09-19 **NEW** DFlash break-even with measured draft and replay=0: propose is **37–42 ms flat in K**. No K beats 10.22. Best **9.39 tok/s** at K=7 (3.00 accepts; need **3.26**). Do not build always-8+GDN commit.
+- 2026-09-18 **NEW** Bonsai affine-2bit codes are genuinely **ternary**: **0 / 3.54e9** code-3. Exact-zero (code 1) **32.8%**. **RESOLVED** — five-trit is lossless on the table; unpack vs qdot is a separate (failed) speed question.
+- 2026-09-19 **HOLD** five-trit unpack. Synthetic global switch 0.88×. **Per-shape mix on real weights: 0 winning (N,K)** (1.31–2.14×). Mixed greedy **10.21 tok/s**, leftover-identical. Keep 2-bit. Does not move T=8 MMA.
+- 2026-09-19 **NEW** After mix, break-even still short: T=8 298 ms, need **3.51** accepts, have 3.00, predicted **8.71 tok/s**. DFlash K=7 e2e **5.07 tok/s** with MMA+replay, identity-ok. Rejects front-loaded (19% slot 0, 38% after one). Acceptance gap, not kernels. Did not train.
