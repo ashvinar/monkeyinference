@@ -25,6 +25,36 @@ _STREAM_COPY_SRC = r"""
     out[i] = inp[i];
 """
 
+# Read-only STREAM: each thread walks the buffer with stride GRID, simd+TG
+# reduce, one float stored per threadgroup so the loads cannot be DCE'd.
+# Write traffic is n_tg * 4 B vs 512 MiB read — counted as read-only.
+_STREAM_READ_SRC = r"""
+    const uint gid = thread_position_in_grid.x;
+    const uint lid = thread_index_in_threadgroup;
+    const uint tg = threadgroup_position_in_grid.x;
+    const uint simd = lid / 32u;
+    float acc = 0.0f;
+    for (uint i = gid; i < N; i += GRID) {
+        acc += float(inp[i]);
+    }
+    acc = simd_sum(acc);
+    threadgroup float sh[8];
+    if (lid % 32u == 0u) {
+        sh[simd] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0u) {
+        out[tg] = sh[0]+sh[1]+sh[2]+sh[3]+sh[4]+sh[5]+sh[6]+sh[7];
+    }
+"""
+
+_STREAM_WRITE_SRC = r"""
+    uint i = thread_position_in_grid.x;
+    if (i < N) {
+        out[i] = T(1);
+    }
+"""
+
 _TERNARY_QMV_SRC = r"""
     // Clone of MLX qmv_fast: 64 threads / TG, 2 simdgroups × 4 rows.
     // 2-bit qdot: pre-shift x by 4^lane, mask-and-accumulate, no per-lane shifts.
@@ -283,6 +313,8 @@ _TERNARY_QMM_SRC = r"""
 """
 
 _stream_copy_kernel = None
+_stream_read_kernel = None
+_stream_write_kernel = None
 _qmv_cache: dict[tuple[int, int, int, type], object] = {}
 _qmv_once_cache: dict[tuple[int, int, int, type], object] = {}
 _qmm_cache: dict[tuple[int, int, int, type], object] = {}
@@ -314,6 +346,60 @@ def stream_copy(inp: mx.array) -> mx.array:
         threadgroup=(tg, 1, 1),
         output_shapes=[inp.shape],
         output_dtypes=[inp.dtype],
+    )[0]
+
+
+def _stream_read():
+    global _stream_read_kernel
+    if _stream_read_kernel is None:
+        _stream_read_kernel = mx.fast.metal_kernel(
+            name="monkey_stream_read",
+            input_names=["inp"],
+            output_names=["out"],
+            header="#include <metal_simdgroup>\n",
+            source=_STREAM_READ_SRC,
+        )
+    return _stream_read_kernel
+
+
+def stream_read_reduce(inp: mx.array, *, tg: int = 256, n_tg: int = 4096) -> mx.array:
+    """Read-only STREAM: reduce `inp` to one float per threadgroup."""
+    n = int(inp.size)
+    grid = n_tg * tg
+    return _stream_read()(
+        inputs=[inp],
+        template=[("T", inp.dtype), ("N", n), ("GRID", grid)],
+        grid=(grid, 1, 1),
+        threadgroup=(tg, 1, 1),
+        output_shapes=[(n_tg,)],
+        output_dtypes=[mx.float32],
+    )[0]
+
+
+def _stream_write():
+    global _stream_write_kernel
+    if _stream_write_kernel is None:
+        _stream_write_kernel = mx.fast.metal_kernel(
+            name="monkey_stream_write",
+            input_names=["n_dummy"],
+            output_names=["out"],
+            source=_STREAM_WRITE_SRC,
+        )
+    return _stream_write_kernel
+
+
+def stream_write(n: int, dtype=mx.float32) -> mx.array:
+    """Write-only STREAM: fill `n` elements with 1, no buffer read."""
+    tg = 256
+    grid = ((n + tg - 1) // tg) * tg
+    dummy = mx.array([n], dtype=mx.uint32)
+    return _stream_write()(
+        inputs=[dummy],
+        template=[("T", dtype), ("N", n)],
+        grid=(grid, 1, 1),
+        threadgroup=(tg, 1, 1),
+        output_shapes=[(n,)],
+        output_dtypes=[dtype],
     )[0]
 
 

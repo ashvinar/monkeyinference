@@ -2,9 +2,9 @@
 
 Living design-and-results doc. Engine repo: [github.com/ashvinar/monkeyinference](https://github.com/ashvinar/monkeyinference) · branch `cursor/ternary-metal-engine-09ea`. Standalone Metal/MLX runtime, not a Splash fork.
 
-**Headline (2026-09-18, night):** Decode is still DRAM-bandwidth bound. Same-run greedy explain is **10.22 tok/s** with Low Power Mode **off**. Leftover greedy on that load is **8.47 tok/s**. The leftover **2.77** / DFlash **0.80** pair was `lowpowermode 1` — marked below, not comparable to 10.22.
+**Headline (2026-09-19):** Decode is DRAM-bandwidth bound. Greedy explain is **10.22 tok/s** (LPM off). Read-only STREAM is **85–94 GB/s**, the same band as copy STREAM **87–94 GB/s** (historical 86.6) — **not** 100–110. Decode resembles a large read, so the ceiling stays **~11.3–12.7 tok/s**, not 13–14. 10.22 is still ~80–90% of it. CPU+GPU disjoint read aggregates **103 GB/s** (GPU 54 + CPU 49); do not build a hybrid path until asked.
 
-DFlash 2 transfers at **3.00 accepts/pass** (K=7, token-identical). Default K=2 is **7.32 tok/s** and does **not** beat 10.22. Prefill and leftover+K verify already share one GDN path: mlx_lm's Metal `gated_delta_kernel`, **48 calls per forward**, `for (int t = 0; t < T; ++t)` inside a single launch, `ArraysCache` written once. There is no chunkwise-parallel WY form in this implementation. Isolated 48-layer GDN is **30 ms at T=1 and 65 ms at T=8** — 12% of the 550 ms T=8 forward. The other 88% is 401 weight-once ternary GEMVs. Forcing those onto the prefill `qmm` path makes T=8 **slower** (863 ms). Prefill's 24 ms/token is large-M qmm amortizing 7.25 GB over T=512, which leftover+K cannot inherit. Speculative decode is a poor fit for this 48-of-64 GDN + ternary-2bit pack on this Air.
+Splash decode is a **fixed 8-row MMA**, never a 1-token GEMV. `ternary_qmv_once` is the wrong kernel class; T=8 at 4.8× T=1 is that, not a missing GDN path. Packed codes are genuinely ternary (0 / 3.54e9 code-3). Next: `ternary_qmm_m8` with gate T=8 / T=1 ≤ **1.3×**.
 
 ## Machine
 
@@ -14,8 +14,12 @@ DFlash 2 transfers at **3.00 accepts/pass** (K=7, token-identical). Default K=2 
 | Chip | Apple M4, 10 CPU (4P+6E), 10 GPU, Metal 4 |
 | Unified memory | 24 GB |
 | Published DRAM | **120 GB/s** (Apple M4 Air spec, LPDDR5X) |
-| Measured STREAM copy | **86.6 GB/s** (Metal `out[i]=inp[i]`, 512 MiB, read+write) |
-| STREAM / published | 72% |
+| GPU STREAM copy | **87–94 GB/s** (median **89** at 512 MiB; historical 86.6). Counts read+write. |
+| GPU STREAM read | **85–94 GB/s** (median **92** at 512 MiB, **85** at 1 GiB). Reduce-to-scalar; decode-like. |
+| GPU STREAM write | **75–84 GB/s** fill |
+| CPU STREAM read | **72 GB/s** (4 P-cores, QoS USER_INTERACTIVE, 512 MiB) |
+| CPU+GPU disjoint read | **103 GB/s** aggregate (GPU 54 + CPU 49). GPU-only 94 in that session. |
+| STREAM / published | copy ~74%; read ~71–78%; hybrid aggregate 86% |
 | OS | macOS 27.0 |
 | Free disk | **~16–18 GB** after adding **1.266 GB** Splash `draft/` only. |
 
@@ -29,20 +33,30 @@ Each greedy decode token streams the language weights once (GEMV), plus a neglig
 | --- | ---: |
 | Published 120 GB/s, with biases (7.674 GB) | **15.6** |
 | Published 120 GB/s, drop biases (7.254 GB) | 16.5 |
-| Measured STREAM 86.6 GB/s, with biases | **11.3** |
-| Measured STREAM 86.6 GB/s, drop biases | **11.9** |
+| GPU copy 86.6 GB/s (historical), with biases | **11.3** |
+| GPU copy 86.6 GB/s, drop biases | **11.9** |
+| GPU read 92 GB/s (512 MiB median), drop biases | **12.7** |
+| GPU read 85 GB/s (1 GiB median, closer to 7 GB), drop biases | **11.7** |
+| CPU+GPU aggregate 103 GB/s, drop biases | 14.2 *(not a plan; see below)* |
 | Starting Prism MLX decode | **8.0** |
-| This engine greedy explain (qdot, no bias load) | **9.74** |
-| 9.74 / 11.3 measured (with-bias ceiling) | **86%** |
-| 9.74 / 11.9 measured (no-bias ceiling) | **82%** |
+| This engine greedy explain (qdot, no bias load) | **10.22** (9.74 same band) |
+| 10.22 / 11.3 historical copy ceiling | **90%** |
+| 10.22 / 11.7 1 GiB-read ceiling | **87%** |
+| 10.22 / 12.7 512 MiB-read ceiling | **80%** |
 | PLD copy-prompt (same prompt as leftover greedy) | **11.70** |
+
+**Read vs copy.** Ashvin’s objection is right in principle: copy STREAM bills read+write, decode is almost pure read. On this Air it does **not** raise the ceiling into 13–14 tok/s. A Metal reduce-to-scalar (4096 TGs × 256 threads, stride over the buffer, `simd_sum` + one store per TG so loads cannot be DCE’d) lands **in the same band as copy**. At 512 MiB, billed copy 89 GB/s vs read 92 GB/s: the copy kernel takes ~2× the wall of the read kernel, which is exactly 2× the traffic at the same instantaneous bus rate. At 1 GiB, read median **85 GB/s** is slightly *below* copy **94 GB/s**. Thermal swing is ±10 GB/s; do not treat a single 93.7 as 110. **Decode resembles GPU read of a many-GB stream. Keep 11.3–12.7 as the greedy ceiling. 10.22 still has a few percent of STREAM slack, not a second qdot project’s worth.**
+
+**CPU+GPU aggregate.** 4 P-core C threads (clang -O3, 8-wide float add, QoS USER_INTERACTIVE) on a **disjoint** 512 MiB buffer while the GPU read kernel runs: **102.8 GB/s** combined vs **93.7 GPU-only** that session (+10%). Under contention the GPU drops to **54 GB/s** and the CPU to **49** (CPU-only was 72). The extra bytes are real; llama.cpp layer-split is existence proof of the mechanics. **Do not build a hybrid decode on this number — report only.**
+
+Five-trit packing at 5.89 GB: 86.6/5.89 = 14.7 stays the briefing roofline; 90/5.89 = 15.3. Survey realized **11.5–13** is unchanged. Packing is still worth its unpack tax if the microbench holds; it is not a new 13-14 greedy story from a higher bus.
 
 Profiling **does not contradict** the two original rulings:
 
-1. **Decode is memory-bandwidth bound.** 9.74 tok/s is most of what this Air can stream. The qdot pass recovered the ~1.4 tok/s that was sitting in `affine_qmv_fast` occupancy / bias traffic, not a 2–3×. Microbenches on this 10-core GPU still swing ±30% with thermal; e2e numbers above are the ones that matter.
-2. **Beating the ceiling requires speculative decode.** PLD on a copyable prompt crosses 11.7 because it commits 2.8 tokens per target pass. That is *not* a general chat number. Self-speculation off Bonsai's own early layers does not provide a cheap general draft (see below).
+1. **Decode is memory-bandwidth bound.** 10.22 tok/s is most of a **read-like** STREAM of 7.254 GB (80–90% depending on 85 vs 92 GB/s). The qdot pass recovered the ~1.4 tok/s sitting in `affine_qmv_fast` occupancy / bias traffic, not a 2–3×. Microbenches on this 10-core GPU still swing ±10 GB/s / ±30% kernel; e2e numbers above are the ones that matter.
+2. **Beating the ceiling requires speculative decode** whose verify is an 8-row matmul, not a matvec handed 8 rows. PLD on a copyable prompt crosses 11.7 because it commits 2.8 tokens per target pass. That is *not* a general chat number. Self-speculation off Bonsai's own early layers does not provide a cheap general draft.
 
-Prism's own laptop table (PQ2_0 GGUF, no speculation): M4 Pro 18 tok/s, M5 Pro 28 tok/s streaming ~204 GB/s. This Air landing at ~10 tok/s greedy on 87 GB/s STREAM is still in family.
+Prism's laptop table is llama-bench tg128 depth 0 (no spec): M4 Pro 18 tok/s, M5 Pro 28, M5 Max 47. 10.22 on 86–92 GB/s is **in family**. Prism's Bonsai-demo is PQ2_0 llama.cpp or stock `mlx_vlm` + Hadamard, **no drafter**. There is no vendor fast path we missed.
 
 ## Architecture decisions
 
@@ -52,7 +66,7 @@ Prism's own laptop table (PQ2_0 GGUF, no speculation): M4 Pro 18 tok/s, M5 Pro 2
 | Text-only load | Vision tower is 0.92 GB FP16 and unused for these prompts. Peak Metal ~8.3 GB. | Keep the tower behind an explicit `--vision` flag later. |
 | Keep Prism activation Hadamard (block 1024, `H(x⊙s)/√1024`) | Weights are stored in that basis. Skipping it is silent garbage. | None. |
 | Default matmul = custom qdot GEMV (`--no-custom` for MLX) | Clone of MLX `qmv_fast`: 64-thread TGs, 2 simdgroups × 4 rows, pre-shifted x, mask-and-accumulate, no bias load (`y = s·(codes·x − Σx)` because Prism stores `bias = −scale`). Hadamard stays `mx.hadamard_transform` immediately before the GEMV (10 KB; inlining a 1024-point FWHT into an output-tiled TG would recompute H(x) per 8 output rows). E2e greedy 8.38 → **9.74**. Layer-level vs MLX `max_abs` 0.013. | `--no-custom`. |
-| Spec verify (M=2..16) = weight-once qdot | MLX stays on `qmv` until M≈12 on these shapes, so leftover+K drafts used to re-stream 7.6 GB per draft token. The once-kernel keeps M in the inner loop; grid is over output-row groups only. Prefill M>16 stays on `mx.quantized_matmul`. | None for spec. |
+| Spec verify (M=2..16) = weight-once qdot | MLX stays on `qmv` until M≈12. Our once-kernel loads 4 weight words then serializes M in the inner loop with `acc[16][4]` always allocated. Pipelined M=8 is 3–5× M=1 on real Bonsai shapes, not STREAM-flat. Prefill M>16 stays on `mx.quantized_matmul`. | Wait for the Splash small-M teardown before writing a new tile. |
 | GDN cache pin is copy-on-write, not memcpy | `gated_delta` already writes a new `state_out`; `GatedDeltaNet` does `cache[i] = new`. Holding the previous array refs / KV offsets is a real CoW pin (~151 MB × 48 layers is **not** copied). Partial reject reverts pointers and replays leftover+accepted (GDN is recurrent; no per-timestep states). | If Apple adds trimmable GDN cache, switch. |
 | First draft = prompt-lookup n-gram (PLD), K=5 | Zero extra weights. K=8+ over-proposes on the copy sentence and pays reject+replay. | Tune K per prompt class. |
 | Self-spec draft = first N layers + shared `lm_head` | Vocab 248320 matches by construction; 0 new bytes. N∈{2,4,6,8} all plateau at ~1.07 accepts/pass. | Do not tune N further. |
@@ -158,7 +172,43 @@ GDN is **65 ms of a 550 ms T=8 model forward** (12%). T=8 path counts: **401× `
 
 Kernel vs ops on one layer: T=1 y max-abs 1.2e-4; T=8 y max-abs 0.031 (fp16). Same recurrence.
 
-**Ruling:** a chunked verify that is just “the prefill GDN path” does not exist as a second implementation. A trainable WY-chunked gated-delta kernel would be new work, would still leave 401 ternary GEMVs, and is out of scope. Speculative leftover+K is a poor fit for this 48-of-64 GDN + 2-bit pack on this Air. That is the finding, not a failed optimization.
+**Ruling:** a chunked verify that is just “the prefill GDN path” does not exist as a second implementation. A trainable WY-chunked gated-delta kernel would be new work, would still leave 401 ternary GEMVs, and is out of scope.
+
+### Small-M GEMV: not near-flat (LPM off, pipelined)
+
+Per-call `mx.synchronize` made a first pass look ~flat (launch latency ≈ kernel). Reran as a pipelined stream (warmup, then N `mx.eval` under one sync) on every PackedLinear shape in a Bonsai forward, including `lm_head`. Bytes below are codes+scales+x+y. STREAM floor is 86.6 GB/s. `mlp_gate` is the same geometry as `mlp_up` and was the first kernel of the run (cold); use `mlp_up` as the warmed number for that shape.
+
+| Shape | N×K | count | bytes once (M=1 / M=8) | M=1 us | M=8 us | M=8/M=1 | GB/s if W once (M=1 / M=8) | GB/s if W×M at M=8 | STREAM us if once |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| mlp_up (warm) | 17408×5120 | 64 | 23.72 / 24.04 MB | **552** | **1982** | **3.59** | 43.0 / 12.1 | 95.7 | 274 |
+| mlp_down | 5120×17408 | 64 | 23.72 / 24.04 MB | 488 | 2061 | **4.22** | 48.6 / 11.7 | ~93 | 274 |
+| gdn_qkv | 10240×5120 | 48 | ~14 MB | 372 | 1315 | 3.54 | 37.6 / 10.8 | |  |
+| gdn_z | 6144×5120 | 48 | | 346 | 911 | 2.63 | 24.2 / 9.4 | |  |
+| gdn_out | 5120×6144 | 48 | | 309 | 924 | 2.99 | 27.1 / 9.2 | |  |
+| attn_q | 6144×5120 | 16 | | 309 | 947 | 3.06 | 27.1 / 9.0 | |  |
+| attn_k | 1024×5120 | 16 | | 209 | 319 | 1.53 | 6.7 / 4.7 | launch-bound |  |
+| attn_v | 1024×5120 | 16 | | 199 | 287 | 1.44 | 7.1 / 5.2 | launch-bound |  |
+| attn_o | 5120×6144 | 16 | | 336 | 889 | 2.65 | 25.0 / 9.6 | |  |
+| lm_head | 248320×5120 | 1 | 338 / 341 MB | **4283** | **22576** | **5.27** | **79.0 / 15.1** | ~119 | 3900 |
+
+Census-weighted (401 linears): predicted GEMV **220 ms at M=1, 689 ms at M=8, ratio 3.13**. Inflated vs in-model T=1 (~84 ms of linears inside 114 ms) because isolated GEMVs do not overlap GDN/Hadamard and `mlp_gate` was cold. In-model T=8 is **553 ms vs 114 ms = 4.83×**.
+
+**Ruling:** amortization of `ternary_qmv_once` is **broken because it is a matvec kernel**, not because a tile is “subtly” failing to keep weights in registers. Splash never runs a 1-token GEMV: decode is compiled as leftover+7, `SPLASH_TARGET_VERIFY_ROWS=8`, `matmul2d_descriptor(8, TileN, 64)`, 256-thread TGs. That is the entire 74 tok/s ≈ 5.4× (15 GiB / 204 GB/s) story. **Do not tune qmv_once further.** Next kernel is `ternary_qmm_m8`: 256-thread TG, dequant into threadgroup memory, then MMA (MPP `matmul2d` if MLX will compile it, else 8-row software MMA with the same TG shape). **Gate: MLP-up 17408×5120, T=8 / T=1 ≤ 1.3×.** Stuffing 2-bit into `uint4b` would double DRAM — do not. Always-8 spec ABI + `verify_gdn_commit` (delete leftover replay) is item 2, after this gate.
+
+Hadamard is not the 4.8×: `fwht` M=1 vs M=8 is ~0.17–0.24 ms and does not track T.
+
+### Packed codes are genuinely ternary
+
+Sampled 18 PackedLinear tensors from the on-disk safetensors (no GPU load): `embed_tokens`, `lm_head`, GDN qkv/out, MLP up/down, full-attn q/k/v/o, at layers 0 / 3 / 31 / 63. Affine-2bit g128, 16 codes per uint32. **3,538,944,000 codes.**
+
+| | c0 (−s) | c1 (0) | c2 (+s) | c3 |
+| --- | ---: | ---: | ---: | ---: |
+| count | 1,197,519,307 | 1,160,343,842 | 1,181,080,851 | **0** |
+| fraction | 0.3384 | **0.3279** | 0.3337 | **0** |
+
+Every quantization group in the sample is ternary-only (no code 3, 0% of groups use 4 levels). Exact-zero fraction is the code-1 rate, **32.8%**, stable across tensors (embed is a hair heavier on c0: 0.343 / 0.328 / 0.329). Layer 31 has no `linear_attn` (it is full-attn); GDN is represented by layer 0.
+
+**Read:** a 5-trits-per-byte pack (`3^5 = 243 < 256`) is a **lossless re-encoding**. Codes 6.822 GB → ~5.46 GB; drop the redundant 0.420 GB biases (`bias = −scale`); stream ≈ **5.89 GB** with scales+signs. STREAM 86.6 / 5.89 ≈ **14.7 tok/s** greedy ceiling vs 11.3 today; published 120 / 5.89 ≈ 20.4. It stacks with a small-M verify fix rather than competing. Costs still to weigh, not build: decode-side unpack (byte LUT or base-3 split vs today’s shifts) against bytes saved; one-time on-disk repack vs load-time. On a bandwidth-bound machine with ALU headroom that is usually the right trade — greedy more than verify, until small-M is actually flat.
 
 ### LPM-throttled rows (do not compare to 10.22)
 
@@ -202,7 +252,8 @@ Tokenizer still warns about the Mistral-Small regex. Outputs were English and co
 
 ```
 src/monkeyinference/
-  kernels.py     Metal STREAM copy + qdot GEMV + weight-once verify (mx.fast.metal_kernel)
+  kernels.py     Metal STREAM copy/read/write + qdot GEMV + weight-once verify
+  stream_cpu.c   P-core STREAM read (QoS USER_INTERACTIVE) for CPU+GPU aggregate
   hadamard.py    Prism fwht
   packed.py      PackedLinear / PackedEmbedding (qdot default; MLX qmm for prefill)
   load.py        text-only safetensors → mlx_lm Qwen3.5 TextModel
@@ -232,9 +283,14 @@ Uses the existing `~/.monkey/mlx-venv` (mlx 0.32.0). No second venv. `--no-custo
 
 ## What's left
 
-1. **Speculation vs this pack.** DFlash K=2 is 7.32 tok/s, identity-ok, and does not beat greedy 10.22. Prefill and verify share sequential GDN; leftover+K cannot inherit T=512 qmm. A WY-chunked GDN kernel is new work and would not move the 401 GEMVs that dominate T=8. Chat speculation on this Air is a poor fit; PLD copy (11.70) remains the only tok/s win, because the prompt is copyable.
-2. **Prefill.** 40.9 tok/s vs llama-bench pp512 47. Compute-bound qmm + sequential GDN at large T; not the chat bottleneck.
-3. Tokenizer regex; sampling; optional vision.
+1. **`ternary_qmm_m8`.** Splash teardown: decode is always 8 rows, 256-thread MMA, not a matvec. Gate T=8 / T=1 ≤ **1.3×** on MLP-up 17408×5120. Until that lands, DFlash’s 3.00 accepts/pass cannot beat 10.22.
+2. **Always-8 spec ABI + `verify_gdn_commit`.** Delete leftover+accepted full-model replay. Survey and Splash independently rank this next. Arithmetic: ~15 tok/s after (1), ~18 with packing.
+3. **DFlash on packed `MDFD0004` with a real Q4 MMA** (the one place Splash’s 4-bit path ports literally). Draft 82→~15 ms is the ~15 vs ~23 band, after (1).
+4. **Five-trit pack** after the histogram (ternary, 0 code-3). Microbench unpack vs qdot on MLP-up; ship if greedy ≥ ~11.5; keep 2-bit fallback. Realized 11.5–13, not 14.7.
+5. **Then** post-Hadamard `|H(x)|` sparsity; TEAL-style qdot only if 30%+ droppable with token identity. Otherwise stop.
+6. Prefill 40.9 vs llama-bench pp512 47 — not the chat bottleneck.
+
+Do not: train a drafter, tree attention / EAGLE / Medusa, fuse the Hadamard, port PowerInfer / Deja Vu, rewrite in Swift, WY-chunked GDN, `uint4b` 2-bit padding, hybrid CPU/GPU decode (103 GB/s is a measurement, not a plan), Apple10 persistent-wave policy.
 
 ## Disk / cleanliness
 
@@ -242,7 +298,7 @@ Added: git repo under `~/projects/monkeyinference` (source). **+1.266 GB** at `~
 
 ## Rulings log
 
-- 2026-09-18 **HOLD** bandwidth-bound decode. Greedy 9.74 tok/s ≈ 86% of measured STREAM / 7.674 GB (82% of the no-bias ceiling).
+- 2026-09-18 **HOLD** bandwidth-bound decode. Greedy 10.22 tok/s is 80–90% of a read-like STREAM / 7.254 GB. Read-only is **not** 100–110 GB/s on this Air.
 - 2026-09-18 **HOLD** speculation required to beat ~11 tok/s in general chat. PLD 11.70 is a copy-prompt number (2.8 accepts/pass), not a chat number.
 - 2026-09-18 **UPDATE** custom qdot GEMV **is** production decode. `--no-custom` remains the Prism MLX path. Layer vs MLX max_abs 0.013; greedy tokens match.
 - 2026-09-18 **UPDATE** Ashvin authorized Splash `draft/` bytes. Fetched **1.266 GB** only. Vocab/hidden match. Do **not** fetch the 17.4 GB package or the 3.85 GB BF16 DFlash2 repo.
@@ -252,4 +308,8 @@ Added: git repo under `~/projects/monkeyinference` (source). **+1.266 GB** at `~
 - 2026-09-18 **HOLD** leftover 2.77 vs greedy 9.74 was **Low Power Mode**, not the DFlash residual. Same-run leftover 8.47 vs greedy 10.22 with LPM off. Leftover never runs the draft stream.
 - 2026-09-18 **HOLD** DFlash residual is float32 because `|h|≈5e4`. fp32 `o_proj` accum + fp16 store is finite and drops accepts to 0 (fp16 ULP 32). That is as narrow as the overflow/precision actually requires.
 - 2026-09-18 **UPDATE** DFlash loop: incremental context KV, query pin, replay without `lm_head`, default K=2. Explain tok/s **7.32** (K=7 still 3.00 accepts/pass at 3.99 tok/s). Does not beat 10.22.
-- 2026-09-18 **HOLD** mlx_lm GDN prefill and verify are the **same sequential kernel**. 48 calls/forward, `ArraysCache` once, isolated GDN 30 ms (T=1) / 65 ms (T=8) of a 550 ms T=8 forward. Prefill 24 ms/token is large-M qmm, not a second GDN algorithm. Forcing leftover+K onto qmm regresses T=8 to 863 ms. Speculative leftover+K is a poor fit for this 48-of-64 GDN + 2-bit pack on this Air.
+- 2026-09-19 **HOLD** GPU **read-only STREAM is the same band as copy** (85–94 vs 87–94 GB/s). Copy wall is ~2× read wall at 512 MiB — same instantaneous bus, 2× traffic. 1 GiB read median 85 GB/s. Decode resembles GPU read. Do not retarget the ceiling to 100–110 GB/s.
+- 2026-09-19 **NEW** CPU+GPU disjoint read aggregates **103 GB/s** vs GPU-only 94 (+10%); GPU drops to 54 under contention. llama.cpp layer-split is existence proof. **Do not build hybrid** until asked.
+- 2026-09-19 **HOLD** mlx_lm GDN prefill and verify are the **same sequential kernel**. Isolated GDN 12% of T=8. WY-chunked GDN remains out of scope.
+- 2026-09-19 **UPDATE** T=8 at 4.8× T=1 is the **wrong kernel class** (`ternary_qmv_once` is a matvec). Splash decode is always M=8 MMA (`q4_mpp_tile`, 256-thread TG). Next: `ternary_qmm_m8`, gate T=8/T=1 ≤ 1.3×. Then always-8 ABI + GDN commit. Then DFlash Q4 MMA on `MDFD0004`.
+- 2026-09-18 **NEW** Bonsai affine-2bit codes are genuinely **ternary**: **0 / 3.54e9** code-3. Exact-zero (code 1) **32.8%**. 5-trits-per-byte is lossless on the table. Ship only after (1)–(2) and an unpack microbench ≥ ~11.5 greedy.

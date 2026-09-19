@@ -4,7 +4,15 @@ import mlx.core as mx
 import numpy as np
 
 from monkeyinference.hadamard import BLOCK, HADAMARD_SCALE, fwht
-from monkeyinference.kernels import mlx_affine_qmv, stream_copy, ternary_gemv, ternary_qmm, ternary_qmv_once
+from monkeyinference.kernels import (
+    mlx_affine_qmv,
+    stream_copy,
+    stream_read_reduce,
+    stream_write,
+    ternary_gemv,
+    ternary_qmm,
+    ternary_qmv_once,
+)
 from monkeyinference.roofline import pack_ternary
 from monkeyinference.spec import PromptLookupDrafter
 
@@ -14,6 +22,21 @@ def test_stream_copy_roundtrip():
     y = stream_copy(x)
     mx.eval(y)
     assert mx.allclose(x, y).item()
+
+
+def test_stream_read_reduce_uses_input():
+    x = mx.ones((4096,), dtype=mx.float32)
+    y = stream_read_reduce(x, n_tg=16)
+    mx.eval(y)
+    s = float(mx.sum(y).item())
+    assert s > 0.0
+
+
+def test_stream_write_fills():
+    y = stream_write(1024)
+    mx.eval(y)
+    assert float(y[0].item()) == 1.0
+    assert float(y[1023].item()) == 1.0
 
 
 def test_fwht_matches_mlx_hadamard():

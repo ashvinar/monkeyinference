@@ -2,7 +2,7 @@
 
 Standalone Metal/MLX engine for [`prism-ml/Ternary-Bonsai-2-27B-mlx-2bit`](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit) on Apple silicon. Not a Splash fork.
 
-Target machine for numbers in this repo: MacBook Air M4, 24 GB, 10 GPU cores, **120 GB/s** published DRAM / **86.6 GB/s** measured STREAM.
+Target machine for numbers in this repo: MacBook Air M4, 24 GB, 10 GPU cores, **120 GB/s** published DRAM. GPU STREAM copy **87–94 GB/s**; GPU read-only **85–94 GB/s** (decode-like, same band — not 100–110). CPU+GPU disjoint read **103 GB/s** aggregate (not a hybrid plan).
 
 ## Why this exists
 
@@ -16,7 +16,7 @@ Bonsai's geometry matches Qwen3.8-27B, but Splash only loads `splash-packed-q4` 
 - Greedy decode, leftover-greedy, prompt-lookup speculative decode, early-exit self-speculation, and Splash DFlash 2 leftover-verify
 - Coherence + token-identity gates wired into `monkeyinference bench`
 
-On this Air, greedy explain is **10.22 tok/s** (Low Power Mode off; 9.74 is the same band). Same-prompt PLD copy is **11.70 tok/s vs 8.19 leftover greedy** (10/10 accept, token-identical). Early-exit plateaus at **1.07 accepts/pass**. Splash DFlash 2 transfers at **3.00 accepts/pass** (K=7) and **7.32 tok/s** at default K=2, token-identical to greedy, and does not beat greedy in wall clock. Prefill and verify share mlx_lm's sequential GDN kernel; leftover+K cannot inherit prefill's large-M qmm. Training a new draft is not required to clear 2× accepts/pass.
+On this Air, greedy explain is **10.22 tok/s** (Low Power Mode off; 9.74 is the same band), 80–90% of a read-like STREAM ceiling of **11.3–12.7 tok/s**. Same-prompt PLD copy is **11.70 tok/s vs 8.19 leftover greedy** (10/10, token-identical). Early-exit plateaus at **1.07 accepts/pass**. Splash DFlash 2 transfers at **3.00 accepts/pass** (K=7) and **7.32 tok/s** at default K=2, token-identical, and does not beat greedy: verify is a matvec handed 8 rows. Splash decode is a fixed 8-row MMA; next kernel is `ternary_qmm_m8` (gate T=8/T=1 ≤ 1.3×). Codes are genuinely ternary (0/3.54e9 code-3). Training a new draft is not required to clear 2× accepts/pass.
 
 ## Run
 

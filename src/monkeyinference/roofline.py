@@ -11,7 +11,14 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 
-from monkeyinference.kernels import GROUP, mlx_affine_qmv, stream_copy, ternary_gemv
+from monkeyinference.kernels import (
+    GROUP,
+    mlx_affine_qmv,
+    stream_copy,
+    stream_read_reduce,
+    stream_write,
+    ternary_gemv,
+)
 
 APPLE_M4_AIR_SPEC_GBS = 120.0
 LANGUAGE_WEIGHT_BYTES = 7.674e9  # Bonsai language tensors, including redundant biases
@@ -42,28 +49,65 @@ def _sync():
 
 
 def bench_stream(nbytes: int = 512 * 1024 * 1024, warmup: int = 5, iters: int = 20) -> dict:
-    """Copy `nbytes` of float32 through a Metal kernel; report GB/s."""
+    """GPU STREAM copy (read+write), read-reduce, and write-fill."""
     n = nbytes // 4
     inp = mx.ones((n,), dtype=mx.float32)
     mx.eval(inp)
-    for _ in range(warmup):
-        out = stream_copy(inp)
-        mx.eval(out)
-    _sync()
-    t0 = time.perf_counter()
-    for _ in range(iters):
-        out = stream_copy(inp)
-        mx.eval(out)
-    _sync()
-    elapsed = time.perf_counter() - t0
-    # copy reads nbytes and writes nbytes
-    gbs = (2.0 * nbytes * iters) / elapsed / 1e9
+
+    def _copy():
+        for _ in range(warmup):
+            mx.eval(stream_copy(inp))
+        _sync()
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            mx.eval(stream_copy(inp))
+        _sync()
+        elapsed = time.perf_counter() - t0
+        return elapsed, (2.0 * nbytes * iters) / elapsed / 1e9
+
+    def _read():
+        for _ in range(warmup):
+            mx.eval(stream_read_reduce(inp))
+        _sync()
+        t0 = time.perf_counter()
+        sink = None
+        for _ in range(iters):
+            sink = stream_read_reduce(inp)
+            mx.eval(sink)
+        _sync()
+        _ = float(mx.sum(sink).item())
+        elapsed = time.perf_counter() - t0
+        return elapsed, (nbytes * iters) / elapsed / 1e9
+
+    def _write():
+        for _ in range(warmup):
+            mx.eval(stream_write(n))
+        _sync()
+        t0 = time.perf_counter()
+        out = None
+        for _ in range(iters):
+            out = stream_write(n)
+            mx.eval(out)
+        _sync()
+        _ = float(out[0].item())
+        elapsed = time.perf_counter() - t0
+        return elapsed, (nbytes * iters) / elapsed / 1e9
+
+    copy_s, copy_gbs = _copy()
+    read_s, read_gbs = _read()
+    write_s, write_gbs = _write()
     return {
         "bytes": nbytes,
         "iters": iters,
-        "elapsed_s": elapsed,
-        "gbs": gbs,
+        "gbs": copy_gbs,
         "kind": "metal_copy_read_plus_write",
+        "elapsed_s": copy_s,
+        "copy_gbs": copy_gbs,
+        "read_gbs": read_gbs,
+        "write_gbs": write_gbs,
+        "read_elapsed_s": read_s,
+        "write_elapsed_s": write_s,
+        "decode_resembles": "read",
     }
 
 
@@ -149,18 +193,22 @@ def bench_qmm_batch(
     return {"n": n, "k": k, "rows": rows}
 
 
-def roofline(stream_gbs: float) -> dict:
+def roofline(stream_gbs: float, read_gbs: float | None = None) -> dict:
     """Decode tokens/s if every language byte is read once per token at `stream_gbs`."""
     spec = APPLE_M4_AIR_SPEC_GBS
     measured = stream_gbs
+    read = read_gbs if read_gbs is not None else stream_gbs
     return {
         "published_dram_gbs": spec,
         "measured_stream_gbs": measured,
+        "measured_read_gbs": read,
         "stream_vs_published": measured / spec,
         "decode_tps_at_published_with_bias": spec * 1e9 / LANGUAGE_WEIGHT_BYTES,
         "decode_tps_at_published_no_bias": spec * 1e9 / LANGUAGE_WEIGHT_BYTES_NO_BIAS,
         "decode_tps_at_measured_with_bias": measured * 1e9 / LANGUAGE_WEIGHT_BYTES,
         "decode_tps_at_measured_no_bias": measured * 1e9 / LANGUAGE_WEIGHT_BYTES_NO_BIAS,
+        "decode_tps_at_read_with_bias": read * 1e9 / LANGUAGE_WEIGHT_BYTES,
+        "decode_tps_at_read_no_bias": read * 1e9 / LANGUAGE_WEIGHT_BYTES_NO_BIAS,
         "starting_decode_tps": STARTING_DECODE_TPS,
         "starting_prefill_tps": STARTING_PREFILL_TPS,
         "starting_fraction_of_published": STARTING_DECODE_TPS / (spec * 1e9 / LANGUAGE_WEIGHT_BYTES),
@@ -169,10 +217,10 @@ def roofline(stream_gbs: float) -> dict:
         else None,
         "ruling": (
             "Decode at 27B / ~2.13–2.25 bpw is DRAM-bandwidth bound. A perfect "
-            "ternary GEMV cannot beat measured_stream_gbs / language_bytes. "
-            "Going above that requires speculative decode (multiple accepted "
-            "tokens per target weight pass), which is why Splash's 74 tok/s is "
-            "not a kernel-only number."
+            "ternary GEMV cannot beat measured_read_gbs / language_bytes. "
+            "Read-only STREAM on this Air is the same band as copy STREAM; "
+            "do not inflate the ceiling. Going above it requires speculative "
+            "decode (multiple accepted tokens per target weight pass)."
         ),
     }
 
@@ -180,6 +228,10 @@ def roofline(stream_gbs: float) -> dict:
 def run(out: Path | None = None) -> dict:
     report = {"machine": machine_info()}
     report["stream"] = bench_stream()
+    report["roofline"] = roofline(
+        report["stream"]["gbs"],
+        read_gbs=report["stream"].get("read_gbs"),
+    )
     # Shapes from Bonsai: hidden 5120, intermediate 17408, vocab 248320
     shapes = [
         ("mlp_up_like", 17408, 5120),
@@ -196,7 +248,6 @@ def run(out: Path | None = None) -> dict:
         qmv.append({"custom": custom, "mlx_affine": ref, "speedup": custom["gbs"] / ref["gbs"] if ref["gbs"] else None})
     report["qmv"] = qmv
     report["qmm_batch"] = bench_qmm_batch()
-    report["roofline"] = roofline(report["stream"]["gbs"])
     if out:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(report, indent=2))
@@ -212,6 +263,8 @@ if __name__ == "__main__":
     rep = run(args.out)
     print(json.dumps({
         "stream_gbs": rep["stream"]["gbs"],
+        "stream_read_gbs": rep["stream"].get("read_gbs"),
+        "stream_write_gbs": rep["stream"].get("write_gbs"),
         "roofline": rep["roofline"],
         "qmv_speedups": [
             {"name": r["custom"]["name"], "custom_gbs": r["custom"]["gbs"], "mlx_gbs": r["mlx_affine"]["gbs"], "speedup": r["speedup"]}
