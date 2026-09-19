@@ -82,6 +82,7 @@ def run_bench(pack: str | Path | None = None, *, parity_layers: int = 8, quick: 
     ]
     if quick:
         jobs = [j for j in jobs if j["name"] not in {"long_prefill"}]
+    runs = {}
     for job in jobs:
         result = generate(
             loaded,

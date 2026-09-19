@@ -31,7 +31,7 @@ Weights are expected at `~/.monkey/models/Ternary-Bonsai-2-27B-mlx-2bit/` (alrea
 
 ## Design and measured numbers
 
-Living document: ask for `docs/ternary-engine.md` in the project store, or read comments in `src/monkeyinference/roofline.py`.
+Living document: [docs/ternary-engine.md](docs/ternary-engine.md) (also the project-store copy Ashvin tracks).
 
 ## Disk
 

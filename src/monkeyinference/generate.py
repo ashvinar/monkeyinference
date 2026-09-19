@@ -202,7 +202,7 @@ def _speculative(
             break
 
     decode_s = time.perf_counter() - t_decode
-    text = tokenizer.decode(generated)
+    text = tokenizer.decode(generated, skip_special_tokens=True)
     n_gen = len(generated)
     return GenerateResult(
         text=text,
