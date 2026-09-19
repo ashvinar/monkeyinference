@@ -2,7 +2,7 @@
 
 Standalone Metal/MLX engine for [`prism-ml/Ternary-Bonsai-2-27B-mlx-2bit`](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit) on Apple silicon. Not a Splash fork.
 
-Target machine for numbers in this repo: MacBook Air M4, 24 GB, 10 GPU cores, **120 GB/s** published DRAM. GPU STREAM copy **87–94 GB/s**; GPU read-only **85–94 GB/s** (decode-like, same band — not 100–110). CPU+GPU disjoint read **103 GB/s** aggregate (not a hybrid plan).
+Target machine for numbers in this repo: MacBook Air M4, 24 GB, 10 GPU cores, **120 GB/s** published DRAM. GPU STREAM copy **87–94 GB/s**; GPU read-only **85–94 GB/s** (decode-like, same band — not 100–110). CPU+GPU disjoint read **103 GB/s** aggregate — **hybrid decode ruled out**.
 
 ## Why this exists
 
@@ -16,7 +16,7 @@ Bonsai's geometry matches Qwen3.8-27B, but Splash only loads `splash-packed-q4` 
 - Greedy decode, leftover-greedy, prompt-lookup speculative decode, early-exit self-speculation, and Splash DFlash 2 leftover-verify
 - Coherence + token-identity gates wired into `monkeyinference bench`
 
-On this Air, greedy explain is **10.22 tok/s** (Low Power Mode off; 9.74 is the same band), 80–90% of a read-like STREAM ceiling of **11.3–12.7 tok/s**. Same-prompt PLD copy is **11.70 tok/s vs 8.19 leftover greedy** (10/10, token-identical). Early-exit plateaus at **1.07 accepts/pass**. Splash DFlash 2 transfers at **3.00 accepts/pass** (K=7) and **7.32 tok/s** at default K=2, token-identical, and does not beat greedy: verify was a matvec handed 8 rows. `ternary_qmm_m8` is the 8-row MMA (flat on that kernel, **2.25× vs greedy qdot**, 1.3× gate missed). Codes are genuinely ternary (0/3.54e9 code-3). Training a new draft is not required to clear 2× accepts/pass.
+On this Air, greedy explain is **10.22 tok/s** (Low Power Mode off; 9.74 is the same band), 80–90% of a read-like STREAM ceiling of **11.3–12.7 tok/s**. Same-prompt PLD copy is **11.70 tok/s vs 8.19 leftover greedy** (10/10, token-identical). Early-exit plateaus at **1.07 accepts/pass**. Splash DFlash 2 transfers at **3.00 accepts/pass** (K=7). Always-8 MMA + measured draft + replay=0 predicts **9.39 tok/s** (need 3.26 accepts) — speculation is formally dead at current acceptance. Five-trit is lossless and **0.88×** qdot (HOLD). Hybrid CPU/GPU is ruled out. Training a new draft is not required to clear 2× accepts/pass; it is also not enough to beat greedy on this GPU.
 
 ## Run
 
