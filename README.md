@@ -50,7 +50,8 @@ From a clean checkout, the same venv works if you `pip install -e .` into it. `p
 | `~/.monkey/models/Ternary-Bonsai-2-27B-mlx-2bit/` | Prism affine-2bit MLX pack (~8.0 GB on disk; 7.67 GB language + 0.92 GB unused vision) | **Yes** for this engine |
 | `~/.monkey/models/Qwen3.8-27B-Splash-draft/draft/` | Splash DFlash 2 Q4 draft, **1.266 GB** | Only for `--draft dflash` |
 | `~/.monkey/models/Ternary-Bonsai-2-27B-PQ2_0.gguf` | llama.cpp PQ2_0, 6.7 GB | **No** — not used here |
-| `~/.monkey/dflash-ft/` | LoRA distill cache (~322 MB: aux + 33 MB adapters) | **No** — overfit; not loaded by default |
+| `~/.monkey/dflash-ft/` | Overfit LoRA r=16 cache (~322 MB) | **No** — 2.09 accepts; not loaded |
+| `~/.monkey/dflash-ft2/` | Bounded LoRA retry (r=8, 1200 prompts) | **No** until it beats 3.70 |
 
 Do not fetch the 17.4 GB Splash package or `incoai/Qwen3.8-27B-DFlash2`.
 
