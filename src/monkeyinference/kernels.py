@@ -22,37 +22,52 @@ _STREAM_COPY_SRC = r"""
 """
 
 _TERNARY_QMV_SRC = r"""
-    // MLX qmv_fast layout: 64 threads / TG, 2 simdgroups, 4 rows each.
-    const uint tid = thread_position_in_grid.x;
-    const uint tg = tid / 64u;
-    const uint lid = tid % 64u;
+    // Clone of MLX qmv_fast: 64 threads / TG, 2 simdgroups × 4 rows.
+    // 2-bit qdot: pre-shift x by 4^lane, mask-and-accumulate, no per-lane shifts.
+    // Prism stores bias = -scale, so y = s * (codes·x - sum(x)) and we never
+    // load the 0.42 GB bias tensor. x is already Hadamard-transformed.
+    const uint lid = thread_index_in_threadgroup;
     const uint simd_gid = lid / 32u;
     const uint simd_lid = lid % 32u;
+    const uint tg = threadgroup_position_in_grid.x;
+    const uint token = threadgroup_position_in_grid.y;
     const uint out_row = tg * 8u + simd_gid * 4u;
     const uint words_per_row = K / 16u;
     const uint groups_per_row = K / 128u;
+    const device T* xrow = x + token * K;
 
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
 
     for (uint w_idx = simd_lid; w_idx < words_per_row; w_idx += 32u) {
         const uint kbase = w_idx * 16u;
         const uint group = w_idx / 8u;
-        const float x0 = float(x[kbase + 0]);
-        const float x1 = float(x[kbase + 1]);
-        const float x2 = float(x[kbase + 2]);
-        const float x3 = float(x[kbase + 3]);
-        const float x4 = float(x[kbase + 4]);
-        const float x5 = float(x[kbase + 5]);
-        const float x6 = float(x[kbase + 6]);
-        const float x7 = float(x[kbase + 7]);
-        const float x8 = float(x[kbase + 8]);
-        const float x9 = float(x[kbase + 9]);
-        const float x10 = float(x[kbase + 10]);
-        const float x11 = float(x[kbase + 11]);
-        const float x12 = float(x[kbase + 12]);
-        const float x13 = float(x[kbase + 13]);
-        const float x14 = float(x[kbase + 14]);
-        const float x15 = float(x[kbase + 15]);
+
+        float xt0, xt1, xt2, xt3, xt4, xt5, xt6, xt7;
+        float xt8, xt9, xt10, xt11, xt12, xt13, xt14, xt15;
+        float xsum = 0.0f;
+        {
+            const float x0 = float(xrow[kbase + 0]);
+            const float x1 = float(xrow[kbase + 1]);
+            const float x2 = float(xrow[kbase + 2]);
+            const float x3 = float(xrow[kbase + 3]);
+            const float x4 = float(xrow[kbase + 4]);
+            const float x5 = float(xrow[kbase + 5]);
+            const float x6 = float(xrow[kbase + 6]);
+            const float x7 = float(xrow[kbase + 7]);
+            const float x8 = float(xrow[kbase + 8]);
+            const float x9 = float(xrow[kbase + 9]);
+            const float x10 = float(xrow[kbase + 10]);
+            const float x11 = float(xrow[kbase + 11]);
+            const float x12 = float(xrow[kbase + 12]);
+            const float x13 = float(xrow[kbase + 13]);
+            const float x14 = float(xrow[kbase + 14]);
+            const float x15 = float(xrow[kbase + 15]);
+            xsum = x0+x1+x2+x3+x4+x5+x6+x7+x8+x9+x10+x11+x12+x13+x14+x15;
+            xt0 = x0;           xt1 = x1 * 0.25f;      xt2 = x2 * 0.0625f;    xt3 = x3 * 0.015625f;
+            xt4 = x4;           xt5 = x5 * 0.25f;      xt6 = x6 * 0.0625f;    xt7 = x7 * 0.015625f;
+            xt8 = x8;           xt9 = x9 * 0.25f;      xt10 = x10 * 0.0625f;  xt11 = x11 * 0.015625f;
+            xt12 = x12;         xt13 = x13 * 0.25f;    xt14 = x14 * 0.0625f;  xt15 = x15 * 0.015625f;
+        }
 
         #pragma unroll
         for (uint r = 0; r < 4u; r++) {
@@ -62,24 +77,28 @@ _TERNARY_QMV_SRC = r"""
             }
             const uint word = w[row * words_per_row + w_idx];
             const float s = float(scales[row * groups_per_row + group]);
-            float local = 0.0f;
-            local += (float((word >> 0) & 3u) - 1.0f) * x0;
-            local += (float((word >> 2) & 3u) - 1.0f) * x1;
-            local += (float((word >> 4) & 3u) - 1.0f) * x2;
-            local += (float((word >> 6) & 3u) - 1.0f) * x3;
-            local += (float((word >> 8) & 3u) - 1.0f) * x4;
-            local += (float((word >> 10) & 3u) - 1.0f) * x5;
-            local += (float((word >> 12) & 3u) - 1.0f) * x6;
-            local += (float((word >> 14) & 3u) - 1.0f) * x7;
-            local += (float((word >> 16) & 3u) - 1.0f) * x8;
-            local += (float((word >> 18) & 3u) - 1.0f) * x9;
-            local += (float((word >> 20) & 3u) - 1.0f) * x10;
-            local += (float((word >> 22) & 3u) - 1.0f) * x11;
-            local += (float((word >> 24) & 3u) - 1.0f) * x12;
-            local += (float((word >> 26) & 3u) - 1.0f) * x13;
-            local += (float((word >> 28) & 3u) - 1.0f) * x14;
-            local += (float((word >> 30) & 3u) - 1.0f) * x15;
-            const float term = local * s;
+            const uint b0 = word & 0xffu;
+            const uint b1 = (word >> 8u) & 0xffu;
+            const uint b2 = (word >> 16u) & 0xffu;
+            const uint b3 = (word >> 24u) & 0xffu;
+            float accum = 0.0f;
+            accum += xt0  * float(b0 & 0x03u);
+            accum += xt1  * float(b0 & 0x0cu);
+            accum += xt2  * float(b0 & 0x30u);
+            accum += xt3  * float(b0 & 0xc0u);
+            accum += xt4  * float(b1 & 0x03u);
+            accum += xt5  * float(b1 & 0x0cu);
+            accum += xt6  * float(b1 & 0x30u);
+            accum += xt7  * float(b1 & 0xc0u);
+            accum += xt8  * float(b2 & 0x03u);
+            accum += xt9  * float(b2 & 0x0cu);
+            accum += xt10 * float(b2 & 0x30u);
+            accum += xt11 * float(b2 & 0xc0u);
+            accum += xt12 * float(b3 & 0x03u);
+            accum += xt13 * float(b3 & 0x0cu);
+            accum += xt14 * float(b3 & 0x30u);
+            accum += xt15 * float(b3 & 0xc0u);
+            const float term = s * (accum - xsum);
             if (r == 0) acc0 += term;
             else if (r == 1) acc1 += term;
             else if (r == 2) acc2 += term;
@@ -92,10 +111,11 @@ _TERNARY_QMV_SRC = r"""
     acc2 = simd_sum(acc2);
     acc3 = simd_sum(acc3);
     if (simd_lid == 0) {
-        if (out_row + 0 < N) y[out_row + 0] = T(acc0);
-        if (out_row + 1 < N) y[out_row + 1] = T(acc1);
-        if (out_row + 2 < N) y[out_row + 2] = T(acc2);
-        if (out_row + 3 < N) y[out_row + 3] = T(acc3);
+        const uint ybase = token * N;
+        if (out_row + 0 < N) y[ybase + out_row + 0] = T(acc0);
+        if (out_row + 1 < N) y[ybase + out_row + 1] = T(acc1);
+        if (out_row + 2 < N) y[ybase + out_row + 2] = T(acc2);
+        if (out_row + 3 < N) y[ybase + out_row + 3] = T(acc3);
     }
 """
 
@@ -222,23 +242,8 @@ def ternary_gemv(
     rows: int = ROWS_DEFAULT,
 ) -> mx.array:
     """y = ternary_W x  for a single vector x [K] or [1, K] or [..., K] with prod=K."""
-    x = mx.reshape(x, (-1,))
-    k = int(x.shape[0])
-    n = int(weight.shape[0])
-    if k % GROUP:
-        raise ValueError(f"K={k} is not a multiple of group size {GROUP}")
-    if weight.shape[1] * PACK != k:
-        raise ValueError(f"weight width {weight.shape[1]} does not pack K={k}")
-    n_tg = (n + 7) // 8
-    out = _qmv_kernel(n, k, 8, x.dtype)(
-        inputs=[x, weight, scales],
-        template=[("T", x.dtype), ("N", n), ("K", k), ("ROWS", 8)],
-        grid=(n_tg * 64, 1, 1),
-        threadgroup=(64, 1, 1),
-        output_shapes=[(n,)],
-        output_dtypes=[x.dtype],
-    )[0]
-    return out
+    x = mx.reshape(x, (1, -1))
+    return mx.reshape(ternary_qmm(x, weight, scales, rows=rows), (int(weight.shape[0]),))
 
 
 def ternary_qmm(
@@ -248,15 +253,33 @@ def ternary_qmm(
     *,
     rows: int = ROWS_DEFAULT,
 ) -> mx.array:
-    """y = x @ ternary_W.T  for x [M, K]."""
-    if x.ndim == 1:
-        return ternary_gemv(x, weight, scales, rows=rows)
+    """y = x @ ternary_W.T  for x [M, K].
+
+    Decode (M=1) and small-M verify use the qdot qmv_fast clone (64-thread TGs).
+    Larger prefill M still uses the token-parallel qmm kernel.
+    """
     orig = x.shape
-    x2 = mx.reshape(x, (-1, orig[-1]))
+    x2 = mx.reshape(x, (-1, orig[-1])) if x.ndim != 1 else mx.reshape(x, (1, -1))
     m, k = int(x2.shape[0]), int(x2.shape[1])
     n = int(weight.shape[0])
-    if m == 1:
-        y = ternary_gemv(x2, weight, scales, rows=rows)
+    if k % GROUP:
+        raise ValueError(f"K={k} is not a multiple of group size {GROUP}")
+    if weight.shape[1] * PACK != k:
+        raise ValueError(f"weight width {weight.shape[1]} does not pack K={k}")
+    # qdot qmv_fast clone: M-parallel GEMVs. Prefer this under ~16 tokens;
+    # above that MLX qmm (PackedLinear) is the production verify path.
+    if m <= 16:
+        n_tg = (n + 7) // 8
+        y = _qmv_kernel(n, k, 8, x.dtype)(
+            inputs=[x2, weight, scales],
+            template=[("T", x.dtype), ("N", n), ("K", k), ("ROWS", 8)],
+            grid=(n_tg * 64, m, 1),
+            threadgroup=(64, 1, 1),
+            output_shapes=[(m, n)],
+            output_dtypes=[x.dtype],
+        )[0]
+        if x.ndim == 1:
+            return mx.reshape(y, (n,))
         return mx.reshape(y, orig[:-1] + (n,))
     n_tg = (n + rows - 1) // rows
     y = _qmm_kernel(n, k, rows, x.dtype)(
@@ -271,9 +294,20 @@ def ternary_qmm(
 
 
 def mlx_affine_qmv(x: mx.array, weight: mx.array, scales: mx.array, biases: mx.array) -> mx.array:
-    """Reference Prism/MLX path: generic affine 2-bit quantized matmul."""
-    return mx.quantized_matmul(
-        x,
+    """Prism/MLX affine 2-bit matmul.
+
+    Always flatten to 2-D `[M, K]`. MLX's Metal dispatch uses
+    `M = x.size / K` when `x` is row-contiguous 2-D, and switches from
+    per-token `qmv` to a single weight-streaming `qmm` once `M` crosses
+    `get_qmv_batch_limit` (about 6–10 on this 10-core M4 for Bonsai
+    shapes). A 3-D `[1, K, H]` leftover+draft tensor is the verify path;
+    leaving it 3-D used to look like a tiny batch of GEMVs.
+    """
+    orig = tuple(x.shape)
+    k = int(orig[-1])
+    x2 = mx.contiguous(mx.reshape(x, (-1, k)))
+    y = mx.quantized_matmul(
+        x2,
         weight,
         scales,
         biases,
@@ -281,3 +315,5 @@ def mlx_affine_qmv(x: mx.array, weight: mx.array, scales: mx.array, biases: mx.a
         group_size=GROUP,
         bits=2,
     )
+    n = int(y.shape[-1])
+    return mx.reshape(y, orig[:-1] + (n,))

@@ -1,4 +1,4 @@
-"""End-to-end bench: speed, numerical parity, coherence on real prompts."""
+"""End-to-end bench: speed, numerical parity, coherence, token identity."""
 
 from __future__ import annotations
 
@@ -13,12 +13,26 @@ from monkeyinference.load import load_text_model
 STARTING_DECODE_TPS = 8.0
 STARTING_PREFILL_TPS = 40.0
 
+COPY_PROMPT = (
+    "Copy the next sentence exactly, then stop.\n"
+    "Speculative decoding proposes several draft tokens and verifies them in parallel."
+)
+FRANCE_PROMPT = "Name the capital of France. Reply with only the city name."
+EXPLAIN_PROMPT = "Explain speculative decoding in two short sentences."
+EARLY_LAYERS_SWEEP = (2, 4, 6, 8)
+
 
 def _coherence(name: str, text: str) -> dict:
     lowered = text.lower()
     if name == "france":
         return {
             "mentions_paris": "paris" in lowered,
+            "looks_garbage": (not text.strip()) or text.count("�") > 3,
+            "text": text,
+        }
+    if name == "copy":
+        return {
+            "copied_sentence": "speculative decoding proposes several draft tokens" in lowered,
             "looks_garbage": (not text.strip()) or text.count("�") > 3,
             "text": text,
         }
@@ -31,7 +45,22 @@ def _coherence(name: str, text: str) -> dict:
     }
 
 
-def run_bench(pack: str | Path | None = None, *, parity_layers: int = 8, quick: bool = False) -> dict:
+def _payload(result) -> dict:
+    return result.to_dict()
+
+
+def _tokens_match(a: list[int] | None, b: list[int] | None) -> bool:
+    if not a or not b:
+        return False
+    return list(a) == list(b)
+
+
+def run_bench(
+    pack: str | Path | None = None,
+    *,
+    parity_layers: int = 8,
+    quick: bool = False,
+) -> dict:
     loaded = load_text_model(pack, use_custom_kernels=False)
     jobs = [
         {
@@ -39,20 +68,47 @@ def run_bench(pack: str | Path | None = None, *, parity_layers: int = 8, quick: 
             "user": "Reply with the single word ready.",
             "max_tokens": 8,
             "speculative": False,
+            "draft": "none",
             "parity": 0,
         },
         {
             "name": "short_decode",
-            "user": "Name the capital of France. Reply with only the city name.",
+            "user": FRANCE_PROMPT,
             "max_tokens": 32,
             "speculative": False,
+            "draft": "none",
             "parity": parity_layers,
         },
         {
+            "name": "paris_leftover",
+            "user": FRANCE_PROMPT,
+            "max_tokens": 32,
+            "speculative": True,
+            "draft": "none",
+            "parity": 0,
+        },
+        {
             "name": "explain",
-            "user": "Explain speculative decoding in two short sentences.",
+            "user": EXPLAIN_PROMPT,
             "max_tokens": 80,
             "speculative": False,
+            "draft": "none",
+            "parity": 0,
+        },
+        {
+            "name": "copy_greedy",
+            "user": COPY_PROMPT,
+            "max_tokens": 40,
+            "speculative": True,
+            "draft": "none",
+            "parity": 0,
+        },
+        {
+            "name": "copy_pld",
+            "user": COPY_PROMPT,
+            "max_tokens": 40,
+            "speculative": True,
+            "draft": "pld",
             "parity": 0,
         },
         {
@@ -67,19 +123,31 @@ def run_bench(pack: str | Path | None = None, *, parity_layers: int = 8, quick: 
             ),
             "max_tokens": 64,
             "speculative": False,
+            "draft": "none",
             "parity": 0,
         },
         {
-            "name": "spec_pld",
-            "user": (
-                "Copy the next sentence exactly, then stop.\n"
-                "Speculative decoding proposes several draft tokens and verifies them in parallel."
-            ),
-            "max_tokens": 40,
+            "name": "explain_leftover",
+            "user": EXPLAIN_PROMPT,
+            "max_tokens": 48,
             "speculative": True,
+            "draft": "none",
             "parity": 0,
         },
     ]
+    early_ns = (4,) if quick else EARLY_LAYERS_SWEEP
+    for n in early_ns:
+        jobs.append(
+            {
+                "name": f"early_n{n}",
+                "user": EXPLAIN_PROMPT,
+                "max_tokens": 48,
+                "speculative": True,
+                "draft": "early",
+                "early_layers": n,
+                "parity": 0,
+            }
+        )
     if quick:
         jobs = [j for j in jobs if j["name"] not in {"long_prefill"}]
     runs = {}
@@ -89,16 +157,54 @@ def run_bench(pack: str | Path | None = None, *, parity_layers: int = 8, quick: 
             job["user"],
             max_tokens=job["max_tokens"],
             speculative=job["speculative"],
+            draft=job.get("draft", "pld"),
+            early_layers=int(job.get("early_layers") or 4),
             parity_layers=job["parity"],
         )
-        runs[job["name"]] = result.__dict__.copy()
+        runs[job["name"]] = _payload(result)
 
     france = _coherence("france", runs["short_decode"]["text"])
     explain = _coherence("spec", runs["explain"]["text"])
+    copy_coh = _coherence("copy", runs["copy_pld"]["text"])
     parity_hits = runs["short_decode"].get("parity") or []
     max_abs = max((h["max_abs"] for h in parity_hits), default=None)
-    # fp16 GEMV vs affine reference: a few ulps is expected; 5e-2 would mean a real bug
     parity_ok = (max_abs is not None and max_abs < 5e-2) if parity_hits else None
+
+    copy_greedy_tps = runs["copy_greedy"]["generation_tps"]
+    copy_pld_tps = runs["copy_pld"]["generation_tps"]
+    copy_speedup = (copy_pld_tps / copy_greedy_tps) if copy_greedy_tps else None
+    copy_identity = _tokens_match(runs["copy_greedy"]["tokens"], runs["copy_pld"]["tokens"])
+    paris_identity = _tokens_match(
+        runs["short_decode"]["tokens"], runs["paris_leftover"]["tokens"]
+    )
+
+    early_rows = {}
+    early_best = None
+    leftover_tokens = runs.get("explain_leftover", {}).get("tokens")
+    for n in early_ns:
+        row = runs.get(f"early_n{n}")
+        if not row:
+            continue
+        rec = {
+            "early_layers": n,
+            "generation_tps": row["generation_tps"],
+            "accepts_per_pass": row["accepts_per_pass"],
+            "accepted_draft": row["accepted_draft"],
+            "proposed_draft": row["proposed_draft"],
+            "verify_passes": row["verify_passes"],
+            "generation_tokens": row["generation_tokens"],
+            "draft_s": row.get("draft_s"),
+            "verify_s": row.get("verify_s"),
+            "replay_s": row.get("replay_s"),
+            "token_identity": _tokens_match(leftover_tokens, row.get("tokens")),
+            "text": row["text"],
+        }
+        early_rows[n] = rec
+        if early_best is None or rec["accepts_per_pass"] > early_best["accepts_per_pass"]:
+            early_best = rec
+    early_plateau = None
+    if early_best is not None:
+        early_plateau = early_best["accepts_per_pass"] < 2.0
 
     decode_tps = runs["explain"]["generation_tps"]
     prefill_tps = (runs.get("long_prefill") or runs["explain"])["prompt_tps"]
@@ -107,7 +213,12 @@ def run_bench(pack: str | Path | None = None, *, parity_layers: int = 8, quick: 
         and not france.get("looks_garbage")
         and explain.get("mentions_speculative_ideas")
         and not explain.get("looks_garbage")
+        and copy_coh.get("copied_sentence")
+        and not copy_coh.get("looks_garbage")
     )
+    pld_beats_greedy = bool(copy_speedup and copy_speedup > 1.15)
+    identity_ok = bool(copy_identity and paris_identity)
+    early_identity_ok = all(r["token_identity"] for r in early_rows.values()) if early_rows else True
     report = {
         "ok": True,
         "pack": str(loaded.pack),
@@ -115,7 +226,7 @@ def run_bench(pack: str | Path | None = None, *, parity_layers: int = 8, quick: 
         "language_gb": loaded.language_bytes / 1e9,
         "skipped_vision_gb": loaded.skipped_vision_bytes / 1e9,
         "runs": runs,
-        "coherence": {"france": france, "explain": explain},
+        "coherence": {"france": france, "explain": explain, "copy": copy_coh},
         "coherence_ok": bool(coherence_ok),
         "parity_max_abs": max_abs,
         "parity_ok": parity_ok,
@@ -124,12 +235,29 @@ def run_bench(pack: str | Path | None = None, *, parity_layers: int = 8, quick: 
         "starting_decode_tps": STARTING_DECODE_TPS,
         "starting_prefill_tps": STARTING_PREFILL_TPS,
         "decode_vs_start": decode_tps / STARTING_DECODE_TPS if STARTING_DECODE_TPS else None,
-        "spec_pld": {
-            "accepted": runs["spec_pld"]["accepted_draft"],
-            "proposed": runs["spec_pld"]["proposed_draft"],
-            "generation_tps": runs["spec_pld"]["generation_tps"],
-            "text": runs["spec_pld"]["text"],
+        "copy_prompt": {
+            "greedy_tps": copy_greedy_tps,
+            "pld_tps": copy_pld_tps,
+            "speedup": copy_speedup,
+            "pld_beats_greedy": pld_beats_greedy,
+            "accepted": runs["copy_pld"]["accepted_draft"],
+            "proposed": runs["copy_pld"]["proposed_draft"],
+            "accepts_per_pass": runs["copy_pld"]["accepts_per_pass"],
+            "token_identity": copy_identity,
+            "greedy_text": runs["copy_greedy"]["text"],
+            "pld_text": runs["copy_pld"]["text"],
         },
+        "paris_token_identity": paris_identity,
+        "early_exit": {
+            "sweep": early_rows,
+            "best": early_best,
+            "plateau_below_2x": early_plateau,
+            "token_identity_ok": early_identity_ok,
+        },
+        "identity_ok": bool(identity_ok and early_identity_ok),
+        "gates_ok": bool(
+            coherence_ok and identity_ok and early_identity_ok and pld_beats_greedy
+        ),
     }
     del loaded
     gc.collect()

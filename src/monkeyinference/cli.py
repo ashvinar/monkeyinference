@@ -20,7 +20,10 @@ def main(argv: list[str] | None = None) -> int:
     p_gen.add_argument("--prompt", default="Name the capital of France. Reply with only the city name.")
     p_gen.add_argument("--max-tokens", type=int, default=32)
     p_gen.add_argument("--speculative", action="store_true")
-    p_gen.add_argument("--custom", action="store_true", help="Use custom ternary GEMV (slower than MLX on this Air so far)")
+    p_gen.add_argument("--draft", choices=("none", "pld", "early"), default="pld")
+    p_gen.add_argument("--num-draft", type=int, default=None)
+    p_gen.add_argument("--early-layers", type=int, default=4)
+    p_gen.add_argument("--custom", action="store_true", help="Use custom ternary GEMV on M=1 (off unless it beats MLX)")
     p_gen.add_argument("--parity", type=int, default=0)
     p_gen.add_argument("--out", type=Path, default=None)
 
@@ -28,7 +31,7 @@ def main(argv: list[str] | None = None) -> int:
     p_bench.add_argument("--pack", type=Path, default=None)
     p_bench.add_argument("--out", type=Path, default=None)
     p_bench.add_argument("--parity", type=int, default=8)
-    p_bench.add_argument("--quick", action="store_true", help="Skip long prefill")
+    p_bench.add_argument("--quick", action="store_true", help="Skip long prefill; early-exit N=4 only")
 
     args = parser.parse_args(argv)
 
@@ -41,6 +44,16 @@ def main(argv: list[str] | None = None) -> int:
             "roofline_decode_tps_measured": rep["roofline"]["decode_tps_at_measured_with_bias"],
             "starting_decode_tps": rep["roofline"]["starting_decode_tps"],
             "fraction_of_measured": rep["roofline"]["starting_fraction_of_measured"],
+            "qmv_speedups": [
+                {
+                    "name": r["custom"]["name"],
+                    "custom_gbs": r["custom"]["gbs"],
+                    "mlx_gbs": r["mlx_affine"]["gbs"],
+                    "speedup": r["speedup"],
+                }
+                for r in rep.get("qmv", [])
+            ],
+            "qmm_batch": rep.get("qmm_batch"),
         }, indent=2))
         return 0
 
@@ -54,9 +67,12 @@ def main(argv: list[str] | None = None) -> int:
             args.prompt,
             max_tokens=args.max_tokens,
             speculative=args.speculative,
+            draft=args.draft,
+            num_draft=args.num_draft,
+            early_layers=args.early_layers,
             parity_layers=args.parity,
         )
-        payload = result.__dict__.copy()
+        payload = result.to_dict()
         print(json.dumps(payload, indent=2))
         if args.out:
             args.out.write_text(json.dumps(payload, indent=2))
@@ -70,7 +86,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.out:
             args.out.parent.mkdir(parents=True, exist_ok=True)
             args.out.write_text(json.dumps(rep, indent=2))
-        ok = rep.get("ok") and rep.get("coherence_ok")
+        ok = rep.get("coherence_ok") and rep.get("identity_ok")
         return 0 if ok else 1
 
     return 2

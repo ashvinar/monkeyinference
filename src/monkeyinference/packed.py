@@ -13,9 +13,9 @@ from monkeyinference import parity as parity_mod
 class PackedLinear(nn.Module):
     """Ternary affine-2bit linear with optional input Hadamard.
 
-    Decode (last axis batch size 1) uses the custom Metal GEMV.
-    Prefill uses the same kernel over tokens, which is still a GEMV-per-token
-    but avoids the generic 2-bit dequant path.
+    Decode (M=1) may use the custom qdot GEMV (`use_custom=True`).
+    Prefill and speculative verify (M>1) always use MLX quantized matmul
+    so one weight stream covers every draft token.
     """
 
     def __init__(
@@ -40,8 +40,14 @@ class PackedLinear(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         if self.block:
+            # Graph-fused with the matmul: 10 KB activation, not a second weight stream.
+            # A 1024-point FWHT cannot live inside the 64-thread output-tiled qmv
+            # without recomputing H(x) once per 8 output rows.
             x = fwht(x, self.signs, inverse=False)
-        if self.use_custom:
+        rows = int(x.size // x.shape[-1]) if x.size else 0
+        # Custom qdot GEMV is the decode (M=1) kernel. Verify (M>1) stays on
+        # MLX qmm so one target pass streams weights once for all draft tokens.
+        if self.use_custom and rows <= 1:
             y = ternary_qmm(x, self.weight, self.scales).astype(self.dtype)
             if parity_mod.PARITY_REMAINING > 0:
                 ref = mlx_affine_qmv(x, self.weight, self.scales, self.biases).astype(

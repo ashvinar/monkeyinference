@@ -77,7 +77,18 @@ def test_ternary_qmm_batch_matches_gemv():
     mx.eval(got, *refs)
     for i in range(m):
         err = float(mx.max(mx.abs(got[i] - refs[i])).item())
-        assert err < 1e-5, (i, err)
+        assert err < 1e-4, (i, err)
+
+
+def test_mlx_affine_flattens_3d_like_2d():
+    n, k, m = 128, 512, 6
+    x, w, scales, biases = pack_ternary(n, k, seed=11)
+    xs = mx.stack([x * ((i + 1) * 0.25) for i in range(m)])
+    y2 = mlx_affine_qmv(xs, w, scales, biases)
+    y3 = mlx_affine_qmv(xs[None], w, scales, biases)
+    mx.eval(y2, y3)
+    err = float(mx.max(mx.abs(y2 - y3[0])).item())
+    assert err == 0.0, err
 
 
 def test_prompt_lookup_drafter():

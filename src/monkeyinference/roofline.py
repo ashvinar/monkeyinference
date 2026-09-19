@@ -111,6 +111,44 @@ def bench_qmv(n: int, k: int, warmup: int = 5, iters: int = 20, custom: bool = T
     }
 
 
+def bench_qmm_batch(
+    n: int = 17408,
+    k: int = 5120,
+    ms: tuple[int, ...] = (1, 4, 6, 8, 12, 16),
+    warmup: int = 3,
+    iters: int = 8,
+) -> dict:
+    """Time MLX affine matmul vs M so we can see the qmv → qmm switch."""
+    _, w, scales, biases = pack_ternary(n, k, seed=7)
+    rng = np.random.default_rng(3)
+    rows = []
+    for m in ms:
+        x = mx.array(rng.standard_normal((m, k)).astype(np.float16))
+        mx.eval(x, w, scales, biases)
+
+        def fn(x=x):
+            return mlx_affine_qmv(x, w, scales, biases)
+
+        for _ in range(warmup):
+            mx.eval(fn())
+        _sync()
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            mx.eval(fn())
+        _sync()
+        elapsed = time.perf_counter() - t0
+        weight_bytes = int(w.nbytes) + int(scales.nbytes) + int(biases.nbytes)
+        us = elapsed / iters * 1e6
+        rows.append({
+            "m": m,
+            "us_per_call": us,
+            "us_per_row": us / m,
+            "gbs_if_weights_once": weight_bytes / (elapsed / iters) / 1e9,
+            "gbs_if_weights_m_times": (weight_bytes * m) / (elapsed / iters) / 1e9,
+        })
+    return {"n": n, "k": k, "rows": rows}
+
+
 def roofline(stream_gbs: float) -> dict:
     """Decode tokens/s if every language byte is read once per token at `stream_gbs`."""
     spec = APPLE_M4_AIR_SPEC_GBS
@@ -157,6 +195,7 @@ def run(out: Path | None = None) -> dict:
         ref["name"] = name
         qmv.append({"custom": custom, "mlx_affine": ref, "speedup": custom["gbs"] / ref["gbs"] if ref["gbs"] else None})
     report["qmv"] = qmv
+    report["qmm_batch"] = bench_qmm_batch()
     report["roofline"] = roofline(report["stream"]["gbs"])
     if out:
         out.parent.mkdir(parents=True, exist_ok=True)
