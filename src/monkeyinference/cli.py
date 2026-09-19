@@ -15,16 +15,28 @@ def main(argv: list[str] | None = None) -> int:
     p_prof = sub.add_parser("profile", help="STREAM + ternary GEMV roofline (no 27B load)")
     p_prof.add_argument("--out", type=Path, default=None)
 
-    p_gen = sub.add_parser("generate", help="Greedy or speculative generate")
+    p_gen = sub.add_parser(
+        "generate",
+        help="Greedy 2-bit qdot generate (default). Speculation is net-negative on this hardware.",
+    )
     p_gen.add_argument("--pack", type=Path, default=None)
     p_gen.add_argument("--prompt", default="Name the capital of France. Reply with only the city name.")
     p_gen.add_argument("--max-tokens", type=int, default=32)
-    p_gen.add_argument("--speculative", action="store_true")
+    p_gen.add_argument(
+        "--speculative",
+        action="store_true",
+        help="Enable leftover-verify speculation (off by default; net-negative vs greedy here)",
+    )
     p_gen.add_argument("--draft", choices=("none", "pld", "early", "dflash"), default="pld")
     p_gen.add_argument("--num-draft", type=int, default=None)
     p_gen.add_argument("--early-layers", type=int, default=4)
     p_gen.add_argument("--custom", action=argparse.BooleanOptionalAction, default=True,
                        help="Custom qdot GEMV on M=1 (default on; --no-custom uses MLX)")
+    p_gen.add_argument(
+        "--mix-five-trit",
+        action="store_true",
+        help="Apply per-shape five-trit gate (empty win table; stays 2-bit). Experiment only.",
+    )
     p_gen.add_argument("--parity", type=int, default=0)
     p_gen.add_argument("--out", type=Path, default=None)
 
@@ -67,7 +79,11 @@ def main(argv: list[str] | None = None) -> int:
         from monkeyinference.generate import generate
         from monkeyinference.load import load_text_model
 
-        loaded = load_text_model(args.pack, use_custom_kernels=args.custom)
+        loaded = load_text_model(
+            args.pack,
+            use_custom_kernels=args.custom,
+            mix_five_trit=args.mix_five_trit,
+        )
         result = generate(
             loaded,
             args.prompt,

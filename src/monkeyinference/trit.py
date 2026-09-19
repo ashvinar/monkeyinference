@@ -1,9 +1,10 @@
 """Five-trit packing: 5 ternary codes per byte, g128 group padded to 130.
 
-Histogram on Bonsai affine-2bit is {0,1,2} only (0 of 3.54e9 code-3), so
-`3^5 = 243 < 256` is a lossless re-encoding. Each g128 group is stored as
-26 bytes (128 codes + 2 pad-ones). Pad is code 1 (exact zero) so dummy
-trits do not contribute. Scales stay g128.
+Gated experiment, not production decode. Histogram on Bonsai affine-2bit is
+{0,1,2} only (0 of 3.54e9 code-3), so `3^5 = 243 < 256` is a lossless
+re-encoding. Real-weight interleaved microbench: 0 winning (N,K) vs 2-bit
+qdot (`TRIT_WIN_NK` empty). `apply_mixed_five_trit` stays as the per-shape
+gate. Production `load_text_model` does not enable it.
 
 Bytes vs 2-bit: 26/32 = 0.8125 (−18.75%). Codes 6.822 GB → 5.543 GB;
 stream with scales+signs ≈ 5.975 GB.

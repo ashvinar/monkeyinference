@@ -1,5 +1,9 @@
 """Draft models and zero-copy cache pins for speculative decode.
 
+Gated experiment. `generate(..., speculative=False)` is the production path.
+On the M4 Air, PLD / early-exit / DFlash are net-negative vs greedy except
+PLD on a copyable prompt. See docs/ternary-engine.md.
+
 GDN (`ArraysCache`) and the Metal gated-delta kernel allocate a *new*
 `state_out` each step and the layer does `cache[i] = new`. KVCache only
 advances `offset` in a preallocated buffer. Holding the previous array

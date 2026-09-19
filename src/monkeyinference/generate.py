@@ -1,4 +1,9 @@
-"""Generation: greedy decode via mlx_lm, plus verified speculative decode."""
+"""Generation: greedy decode via mlx_lm, plus verified speculative decode.
+
+Default is greedy 2-bit qdot (`speculative=False`). Speculative leftover-verify
+is implemented for PLD / early-exit / DFlash and is net-negative vs greedy on
+the M4 Air this engine was measured on. See docs/ternary-engine.md.
+"""
 
 from __future__ import annotations
 

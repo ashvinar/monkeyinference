@@ -13,3 +13,24 @@ venv/
 results/
 *.jsonl
 .mlx_kernel_cache/
+
+# One-off kernel-tuning probes kept on disk as local notes, not the engine record.
+scripts/probe_custom_vs_mlx.py
+scripts/probe_fp16_m8.py
+scripts/probe_greedy_leftover_clean.py
+scripts/probe_leftover_regression.py
+scripts/probe_mma_compile.py
+scripts/probe_mpp_16.py
+scripts/probe_mpp_tg.py
+scripts/probe_qdot_m8_256.py
+scripts/probe_qmm_i8.py
+scripts/probe_qmm_i8_stable.py
+scripts/probe_qmm_k32_stable.py
+scripts/probe_qmm_m8_stable.py
+scripts/probe_qmm_m8_tune.py
+scripts/probe_qmm_m8_var.py
+scripts/probe_qmm_shapes.py
+scripts/probe_qmv_once_m.py
+scripts/probe_t8_linears.py
+scripts/probe_uint2b.py
+scripts/probe_verify_m.py

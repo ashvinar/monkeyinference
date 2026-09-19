@@ -3,6 +3,9 @@
 Skips the 0.92 GB FP16 vision tower. Replaces Linear/Embedding modules listed
 in config.json with PackedLinear / PackedEmbedding so the Hadamard contract
 is applied. Ordinary mlx_lm loaders skip that transform and emit garbage.
+
+Production load is 2-bit qdot (`mix_five_trit=False`). The five-trit mixer is
+an experiment with an empty win table; pass mix_five_trit=True to apply it.
 """
 
 from __future__ import annotations
@@ -49,7 +52,7 @@ def load_text_model(
     *,
     use_custom_kernels: bool = True,
     load_tokenizer: bool = True,
-    mix_five_trit: bool = True,
+    mix_five_trit: bool = False,
     trit_wins: frozenset | None = None,
 ) -> LoadedModel:
     pack = Path(pack or DEFAULT_PACK)
@@ -101,6 +104,9 @@ def load_text_model(
     mx.eval(model.parameters())
 
     mix_report = None
+    # Production decode is 2-bit qdot. Five-trit is a gated experiment:
+    # TRIT_WIN_NK is empty, so enabling this still keeps every linear on 2-bit
+    # unless a caller passes a non-empty trit_wins set.
     if use_custom_kernels and mix_five_trit:
         from monkeyinference.trit import apply_mixed_five_trit
 
